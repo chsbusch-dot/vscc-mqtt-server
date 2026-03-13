@@ -1,0 +1,6 @@
+fastapi
+python-dateutil
+aiofiles
+asyncpg
+aiomqtt
+uvicorn

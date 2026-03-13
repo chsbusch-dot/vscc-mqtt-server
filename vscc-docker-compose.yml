@@ -1,0 +1,41 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg14
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: telemetry
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./vscc-init-timescaledb.sql:/docker-entrypoint-initdb.d/init.sql
+      - timescaledb_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  vscc-emqx:
+    image: emqx/emqx:latest
+    ports:
+      - "1883:1883"
+      - "8083:8083"
+      - "8084:8084"
+      - "18083:18083"
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: vscc-worker.Dockerfile
+    depends_on:
+      - timescaledb
+      - vscc-emqx
+    ports:
+      - "8001:8000" # Expose FastAPI for historic data
+    environment:
+      - DB_DSN=postgresql://postgres:password@timescaledb:5432/telemetry
+      - MQTT_BROKER=vscc-emqx
+    volumes:
+      - ./VSCapture:/app/VSCapture
+    restart: unless-stopped
+
+volumes:
+  timescaledb_data:

@@ -1,0 +1,18 @@
+# Downloaded binaries
+VSCapture/
+
+# Python environments
+.venv_viz/
+.venv/
+**/.venv/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS
+.DS_Store
+**/.DS_Store

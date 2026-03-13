@@ -1,0 +1,9 @@
+# Default listener for Python worker (Raw TCP)
+listener 1883
+protocol mqtt
+allow_anonymous true
+
+# WebSocket listener for React/Vite Client
+listener 9001
+protocol websockets
+allow_anonymous true

@@ -1,0 +1,29 @@
+# Git files
+.git
+.gitignore
+
+# Python cache and virtual environments
+__pycache__/
+.venv_viz/
+
+# VSCapture binaries and data - this is mounted as a volume, not part of the image
+VSCapture/
+
+# Installer, helper scripts, and other non-worker scripts
+install.sh
+update.sh
+vscc-install-capture-cli.sh
+vscc-install-websocket-streamer.sh
+vscc-file-cleanup.py
+vscc-websocket-streamer.py
+
+# Docker and database setup files
+vscc-docker-compose.yml
+vscc-init-timescaledb.sql
+vscc-mosquitto.conf.bak
+
+# Documentation
+README.md
+
+# The Dockerfile for this build should not be in the context
+vscc-worker.Dockerfile
