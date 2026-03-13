@@ -83,6 +83,21 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# Attempt to install missing dependencies if apt-get is available
+if command -v apt-get &> /dev/null; then
+    MISSING_DEPS=""
+    if ! command -v timeout &> /dev/null; then
+        MISSING_DEPS="coreutils"
+    fi
+    if ! command -v mosquitto_sub &> /dev/null; then
+        MISSING_DEPS="$MISSING_DEPS mosquitto-clients"
+    fi
+    if [ -n "$MISSING_DEPS" ]; then
+        echo "Installing dependencies ($MISSING_DEPS)..."
+        apt-get update && apt-get install -y $MISSING_DEPS
+    fi
+fi
+
 # Check for essential commands
 for cmd in docker wget unzip timeout mosquitto_sub; do
   if ! command -v $cmd &> /dev/null; then
