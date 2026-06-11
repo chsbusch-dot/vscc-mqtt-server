@@ -218,5 +218,27 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 
 @app.get("/api/historic/{range_minutes}")
 async def get_historic_data(range_minutes: int):
-    # Unchanged
-    pass
+    """
+    The React UI hits this when zooming out past the live window.
+    range_minutes is coerced to int by FastAPI, so it is safe to inline.
+    """
+    query = f"""
+        SELECT time, physio_id, value
+        FROM patient_numerics
+        WHERE time >= NOW() - INTERVAL '{range_minutes} minutes'
+        ORDER BY time ASC
+    """
+
+    async with db_pool.acquire() as connection:
+        records = await connection.fetch(query)
+
+    # Format for the React charting engine
+    history = {}
+    for r in records:
+        pid = r['physio_id']
+        if pid not in history:
+            history[pid] = []
+        # Standardize on Unix Epoch Seconds (Float)
+        history[pid].append({"time": r['time'].timestamp(), "value": r['value']})
+
+    return history
