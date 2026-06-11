@@ -27,6 +27,7 @@ vscc-mqtt-server/
 ├── .dockerignore           # Optimizes the Docker build by excluding unnecessary files
 ├── vscc_mqtt_timescale_worker.py # Python script for the worker service
 ├── vscc-file-cleanup.py    # Utility script to manage log file sizes
+├── vscc-rawdata-spotcheck.py # Diagnostic: detect real vitals vs flatline/noise in exports
 └── README.md               # This file
 ```
 
@@ -61,6 +62,39 @@ The installer automatically sets up cron jobs to keep the system running smoothl
 
 -   **Hourly File Cleanup:** The `VSCaptureCLI` tool generates several large data files. To prevent these from consuming excessive disk space, the `vscc-file-cleanup.py` script runs every hour and truncates any data file that grows beyond 20MB.
 -   **Quarterly Updates:** The `update.sh` script runs every three months to pull the latest changes for the project components.
+
+## Raw Data Spot-Check
+
+`VSCaptureCLI` produces multi-GB waveform CSVs (ECG, EEG, PLETH, RESP) plus a
+numerics JSON. To tell whether an export holds a **real vital-sign trace** or is
+just a **flatline / noise** — without reading the whole file — use
+`vscc-rawdata-spotcheck.py`. It never loads more than a few MB into memory.
+
+It targets the same files as `vscc-file-cleanup.py` and defaults to the
+`VSCapture/` capture dir (override with `VSC_CAPTURE_DIR`).
+
+Two modes:
+
+-   **Fast sampler (default):** seeks to ~20 evenly-spaced offsets, reads a small
+    window at each, and reports per-window stats (min/max/std, distinct values,
+    oscillation) with a `SIGNAL` / `NEAR-FLAT` / `FLAT` / `NOISE?` label.
+    Sub-second even on a 2 GB file. A trace that only toggles between 1–2
+    adjacent quantization levels is flagged `NEAR-FLAT`, not signal.
+-   **Streaming profile (`--profile`):** one constant-memory pass reporting the
+    distinct-value count per segment. Slower, but **cannot miss intermittent
+    signal** — the fast sampler can skip a short live stretch between its probe
+    points.
+
+```bash
+# fast triage of all known exports in the capture dir
+python3 vscc-rawdata-spotcheck.py
+
+# check specific files
+python3 vscc-rawdata-spotcheck.py /path/to/NOM_PLETHWaveExport.csv
+
+# definitive scan when you need certainty (catches sparse signal)
+python3 vscc-rawdata-spotcheck.py --profile /path/to/NOM_PLETHWaveExport.csv
+```
 
 ## Uninstallation
 
