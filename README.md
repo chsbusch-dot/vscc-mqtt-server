@@ -28,6 +28,7 @@ vscc-mqtt-server/
 ├── vscc_mqtt_timescale_worker.py # Python script for the worker service
 ├── vscc-file-cleanup.py    # Utility script to manage log file sizes
 ├── vscc-rawdata-spotcheck.py # Diagnostic: detect real vitals vs flatline/noise in exports
+├── vscc-rawdata-format-probe.py # Diagnostic: identify the format of JSON / raw export files
 └── README.md               # This file
 ```
 
@@ -94,6 +95,27 @@ python3 vscc-rawdata-spotcheck.py /path/to/NOM_PLETHWaveExport.csv
 
 # definitive scan when you need certainty (catches sparse signal)
 python3 vscc-rawdata-spotcheck.py --profile /path/to/NOM_PLETHWaveExport.csv
+```
+
+## Raw Data Format Probe
+
+Where the spot-check answers *"is there live data?"*, `vscc-rawdata-format-probe.py`
+answers *"what IS this file?"* — handy when deciding how to parse an export or feed
+it into a pipeline. Same capture-dir convention (`VSC_CAPTURE_DIR`).
+
+-   **`DataExportVSC.json`** — reports the framing (it's **line-delimited JSON
+    arrays / NDJSON with a UTF-8 BOM**, *not* one JSON document, so a plain
+    `json.load()` fails), record count, schema, batch sizes, DeviceIDs, distinct
+    PhysioIDs, and the captured time span.
+-   **`MPrawoutput.txt`** — the raw **Philips IntelliVue / IEEE-11073 Data Export**
+    stream as dash-separated hex. Reports BOM, frame (line) count, frame-size
+    distribution (waveform sample-array frames vs. numerics/keepalive), total
+    decoded protocol bytes, and the IEEE/Philips OID arc. The CSV and JSON exports
+    are decoded from this single stream.
+
+```bash
+python3 vscc-rawdata-format-probe.py                 # known files in capture dir
+python3 vscc-rawdata-format-probe.py /path/to/DataExportVSC.json /path/to/MPrawoutput.txt
 ```
 
 ## Uninstallation
