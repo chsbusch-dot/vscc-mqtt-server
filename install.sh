@@ -54,7 +54,7 @@ if [ "$1" == "-u" ]; then
     fi
 
     # 5. Remove local directories and virtual environments
-    echo "Removing VSCapture binaries and Python virtual environments..."
+    #echo "Removing VSCapture binaries and Python virtual environments..."
     rm -rf VSCapture
     rm -rf .venv_viz
     rm -rf .venv
@@ -64,8 +64,8 @@ if [ "$1" == "-u" ]; then
     if command -v apt-get &> /dev/null; then
         # WARNING: Removing python3 can be risky on some systems as it is a dependency for system tools.
         # python3-pip is included here as it was installed by the streamer script.
-        apt-get remove -y dotnet-runtime-8.0 mosquitto-clients
-        apt-get autoremove -y
+       apt-get remove -y dotnet-runtime-8.0 mosquitto-clients
+       apt-get autoremove -y
     else
         echo "apt-get not found. Skipping package removal."
     fi
@@ -175,6 +175,75 @@ chmod +x update.sh
 # --- 4. Install Systemd Services ---
 echo "Installing VSCapture CLI service..."
 ./vscc-install-capture-cli.sh "$DEVICE_IP"
+
+# --- PATCH: Create a Keep-Alive Wrapper for VSCapture ---
+# This prevents the service from entering a 'failed' state if the monitor is offline
+# or if the connection drops. It will simply retry indefinitely.
+
+WRAPPER_SCRIPT="$(pwd)/VSCapture/vscc-loop.sh"
+SERVICE_FILE="/etc/systemd/system/vscc-capture-cli.service"
+
+echo "Creating keep-alive wrapper at $WRAPPER_SCRIPT..."
+cat <<EOF > "$WRAPPER_SCRIPT"
+#!/bin/bash
+cd "\$(dirname "\$0")"
+# Use full path to dotnet if possible, otherwise assume in PATH
+DOTNET_CMD=\$(command -v dotnet || echo "/usr/bin/dotnet")
+
+echo "[Wrapper] Service started (PID \$\$)."
+
+# User-specified advanced capture command with WebSocket export
+# Note: Port 8083 is the default EMQX WebSocket listener. Path is /mqtt
+# Master Command: dotnet VSCaptureCLI.dll --devices 1 --device1type 1 --device1model 1 --device1arg "-mode 2 -port 192.168.1.215 -interval 3 -export 4 -devid mp50 -waveset 12 -scale 2"
+
+CMD="\$DOTNET_CMD VSCaptureCLI.dll --devices 1 --device1type 1 --device1model 1 --device1arg '-mode 2 -port $DEVICE_IP -interval 1 -export 4 -devid mp50  -waveset 12 -scale 2'"
+
+echo "[Wrapper] Configuration:"
+echo "  - Target Monitor: $DEVICE_IP"
+echo "  - MQTT URL: ws://127.0.0.1:8083/mqtt"
+echo "  - Full Command: \$CMD"
+
+while true; do
+    # 1. PING CHECK: Wait for the monitor to be physically reachable
+    # This prevents UDP timeout crashes and log spam when the monitor is off.
+    if ping -c 1 -W 2 "$DEVICE_IP" > /dev/null 2>&1; then
+        echo "[Wrapper] Monitor ($DEVICE_IP) is ONLINE. Launching capture process..."
+        
+        # VSCaptureCLI crashes if Console.KeyAvailable is checked without a TTY.
+        # We use 'script' to fake a PTY (Pseudo-Terminal).
+        # We pipe to awk. If a UDP timeout occurs, awk exits, breaking the pipe.
+        # This sends SIGPIPE to VSCapture, instantly bypassing the "Press Escape" hang!
+        script -q -c "\$CMD" /dev/null | awk '{print} /Connection timed out/{print "[Wrapper] UDP Timeout detected. Forcing restart..."; fflush(); exit}'
+        
+        echo "[Wrapper] Process exited. Restarting in 5s..."
+        sleep 5
+    else
+        echo "[Wrapper] Monitor ($DEVICE_IP) is OFFLINE. Ping failed. Waiting..."
+    fi
+    
+    # 15-second delay to prevent CPU spinning
+    sleep 10
+done
+EOF
+chmod +x "$WRAPPER_SCRIPT"
+
+# Patch the systemd service to use the wrapper instead of direct dotnet call
+if [ -f "$SERVICE_FILE" ]; then
+    echo "Patching systemd service to use keep-alive wrapper..."
+    # Fully replace the ExecStart line to ensure valid syntax and prevent trailing garbage
+    sed -i "s|^ExecStart=.*|ExecStart=$WRAPPER_SCRIPT|" "$SERVICE_FILE"
+    
+    # Remove the sleep delay to speed up startup (wrapper handles waiting now)
+    echo "Optimizing service startup time..."
+    sed -i "/^ExecStartPre/d" "$SERVICE_FILE"
+    
+    # Force systemd to kill the blocked process quickly instead of waiting 90 seconds
+    echo "Optimizing shutdown timeouts..."
+    sed -i "s/^KillSignal=.*/KillSignal=SIGKILL\nTimeoutStopSec=5/" "$SERVICE_FILE"
+    
+    systemctl daemon-reload
+    systemctl restart vscc-capture-cli.service
+fi
 
 echo "Installing WebSocket streamer service..."
 ./vscc-install-websocket-streamer.sh

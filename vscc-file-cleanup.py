@@ -34,6 +34,8 @@ def cleanup_files():
         print(f"Warning: Capture directory not found at '{CAPTURE_DIR}'. Skipping cleanup.")
         return
 
+    files_truncated = False
+
     for filename in FILES_TO_CLEAN:
         file_path = CAPTURE_DIR / filename
         
@@ -58,6 +60,7 @@ def cleanup_files():
 
                 if process.returncode == 0:
                     print(f"Successfully truncated '{filename}'.")
+                    files_truncated = True
                 else:
                     print(f"Error truncating '{filename}': {process.stderr}")
 
@@ -66,6 +69,14 @@ def cleanup_files():
             print(f"File '{filename}' not found during processing. Skipping.")
         except Exception as e:
             print(f"An unexpected error occurred while processing '{filename}': {e}")
+
+    # If files were replaced, VSCapture is now writing to orphaned file handles.
+    # We must gracefully kill the VSCapture process so the vscc-loop.sh wrapper 
+    # can catch the exit and automatically restart it to bind to the new file inodes.
+    if files_truncated:
+        print("Files were truncated. Restarting VSCapture process to bind to new files...")
+        # Both the cron job and the service run under the same user, so pkill does not need sudo
+        subprocess.run("pkill -f VSCaptureCLI.dll", shell=True)
 
 if __name__ == "__main__":
     print("========================================")
