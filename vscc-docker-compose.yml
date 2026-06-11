@@ -1,6 +1,6 @@
 services:
   timescaledb:
-    image: timescale/timescaledb:latest-pg14
+    image: timescale/timescaledb:2.19.3-pg14
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
@@ -13,7 +13,7 @@ services:
     restart: unless-stopped
 
   vscc-emqx:
-    image: emqx/emqx:latest
+    image: emqx/emqx:6.0.0
     ports:
       - "1883:1883"
       - "8083:8083"
