@@ -20,40 +20,55 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 DB_DSN = os.getenv("DB_DSN", "postgresql://postgres:password@127.0.0.1:5432/telemetry")
 WAVEFORM_DISCONNECT_TIMEOUT = 3.0  # Seconds
 
-# --- File & Topic Mapping (Corrected Topic Names) ---
+# --- File & Topic Mapping ---
+#
+# Numerics: DataExportVSC.json carries EVERY parameter PhysioID, so any new
+# numeric (e.g. a BIS index from a newly-connected module) is already picked up
+# by the JSON tailer with no code change.
+#
+# Waveforms: one CSV per signal (NOM_<id>WaveExport.csv). Rather than hardcode a
+# list, we DISCOVER them by glob and keep scanning, so new modules (BIS EEG,
+# capnography, ABP, ...) stream live the moment they appear.
 
-FILE_CONFIGS = [
-    {
-        "path": BASE_DIR / "DataExportVSC.json",
-        "type": "json",
-        "topic": "mp50/VitalSigns",
-        "physio_id": None,
-    },
-    {
-        "path": BASE_DIR / "NOM_ECG_ELEC_POTL_IIWaveExport.csv",
-        "type": "csv",
-        "topic": "mp50/HF-ECG",
-        "physio_id": "NOM_ECG_ELEC_POTL_II",
-    },
-    {
-        "path": BASE_DIR / "NOM_EEG_ELEC_POTL_CRTXWaveExport.csv",
-        "type": "csv",
-        "topic": "mp50/HF-EEG",
-        "physio_id": "NOM_EEG_ELEC_POTL_CRTX",
-    },
-    {
-        "path": BASE_DIR / "NOM_PLETHWaveExport.csv",
-        "type": "csv",
-        "topic": "mp50/HF-PLETH",
-        "physio_id": "NOM_PLETH",
-    },
-    {
-        "path": BASE_DIR / "NOM_RESPWaveExport.csv",
-        "type": "csv",
-        "topic": "mp50/HF-RESP",
-        "physio_id": "NOM_RESP",
-    },
-]
+NUMERICS_CONFIG = {
+    "path": BASE_DIR / "DataExportVSC.json",
+    "type": "json",
+    "topic": "mp50/VitalSigns",
+    "physio_id": None,
+}
+
+WAVE_GLOB = "NOM_*WaveExport.csv"
+
+# Friendly short topic names for the common waves (keeps existing dashboard
+# subscriptions working). Unknown waves fall back to a slug derived from the
+# PhysioID, so the dashboard can wildcard-subscribe to mp50/HF-#.
+WAVE_TOPIC_ALIASES = {
+    "NOM_ECG_ELEC_POTL_II": "HF-ECG",
+    "NOM_EEG_ELEC_POTL_CRTX": "HF-EEG",
+    "NOM_PLETH": "HF-PLETH",
+    "NOM_RESP": "HF-RESP",
+}
+
+
+def physio_id_from_wave_file(path: Path) -> str:
+    """NOM_PLETHWaveExport.csv -> NOM_PLETH"""
+    suffix = "WaveExport.csv"
+    name = path.name
+    return name[:-len(suffix)] if name.endswith(suffix) else path.stem
+
+
+def wave_topic(physio_id: str) -> str:
+    short = WAVE_TOPIC_ALIASES.get(physio_id)
+    if short is None:
+        base = physio_id[4:] if physio_id.startswith("NOM_") else physio_id
+        short = "HF-" + base
+    return f"mp50/{short}"
+
+
+def wave_config(path: Path) -> Dict[str, Any]:
+    physio_id = physio_id_from_wave_file(path)
+    return {"path": path, "type": "csv", "topic": wave_topic(physio_id),
+            "physio_id": physio_id}
 
 # Global batch buffers for TimescaleDB
 numerics_buffer = []
@@ -188,6 +203,25 @@ async def tail_file(config: Dict[str, Any], client: aiomqtt.Client):
             print(f"Error tailing {file_path.name}: {e}")
             await asyncio.sleep(1)
 
+# --- 2b. Waveform Auto-Discovery ---
+async def wave_discovery_loop(client: aiomqtt.Client, tailed_paths: set):
+    """Periodically scan the data dir for NEW wave-export files (e.g. a module
+    like BIS connected mid-session) and launch a tailer for each. Each file is
+    tailed once; tail_file itself survives truncation/rotation, so we only spawn
+    for paths not already running."""
+    while True:
+        try:
+            for path in sorted(BASE_DIR.glob(WAVE_GLOB)):
+                if path in tailed_paths:
+                    continue
+                tailed_paths.add(path)
+                config = wave_config(path)
+                print(f"Discovered waveform: {path.name} -> {config['topic']} ({config['physio_id']})")
+                asyncio.create_task(tail_file(config, client))
+        except Exception as e:
+            print(f"Wave discovery error: {e}")
+        await asyncio.sleep(10)
+
 # --- 3. App Lifespan & FastAPI ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -209,8 +243,11 @@ async def lifespan(app: FastAPI):
                 async with aiomqtt.Client(MQTT_BROKER, port=MQTT_PORT) as client:
                     print(f"Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
                     tasks.append(asyncio.create_task(batch_inserter()))
-                    for config in FILE_CONFIGS: tasks.append(asyncio.create_task(tail_file(config, client)))
-                    print(f"Launched {len(FILE_CONFIGS)} file tailers and 1 DB worker.")
+                    # Numerics: one fixed JSON tailer (carries every parameter PhysioID).
+                    tasks.append(asyncio.create_task(tail_file(NUMERICS_CONFIG, client)))
+                    # Waveforms: discovered dynamically so new modules stream with no code change.
+                    tasks.append(asyncio.create_task(wave_discovery_loop(client, set())))
+                    print("Launched numerics tailer + waveform auto-discovery + DB batch worker.")
                     app_started = True
                     yield
             except aiomqtt.MqttError as e:
