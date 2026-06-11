@@ -33,6 +33,7 @@ services:
     environment:
       - DB_DSN=postgresql://postgres:password@timescaledb:5432/telemetry
       - MQTT_BROKER=vscc-emqx
+      - MONITOR_TZ=America/Los_Angeles # timezone of the VSCapture host clock
     volumes:
       - ./VSCapture:/app/VSCapture
     restart: unless-stopped

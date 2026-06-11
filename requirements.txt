@@ -4,3 +4,4 @@ aiofiles
 asyncpg
 aiomqtt
 uvicorn
+tzdata

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Union, List, Dict, Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,11 +62,14 @@ db_pool = None
 
 # --- Utility Functions ---
 
+# VSCapture timestamps are wall-clock time of the capture host, not UTC.
+MONITOR_TZ = ZoneInfo(os.getenv("MONITOR_TZ", "America/Los_Angeles"))
+
 def parse_vsc_timestamp(raw_time: str) -> Union[datetime, None]:
     if not raw_time: return None
-    try: return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S.%f").replace(tzinfo=timezone.utc)
+    try: return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S.%f").replace(tzinfo=MONITOR_TZ).astimezone(timezone.utc)
     except ValueError:
-        try: return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S").replace(tzinfo=timezone.utc)
+        try: return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S").replace(tzinfo=MONITOR_TZ).astimezone(timezone.utc)
         except ValueError: return None
 
 # --- 1. The Database Batch Worker ---
@@ -198,15 +202,24 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(5)
     
     tasks = []
+    app_started = False
     try:
-        async with aiomqtt.Client(MQTT_BROKER, port=MQTT_PORT) as client:
-            print(f"Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
-            tasks.append(asyncio.create_task(batch_inserter()))
-            for config in FILE_CONFIGS: tasks.append(asyncio.create_task(tail_file(config, client)))
-            print(f"Launched {len(FILE_CONFIGS)} file tailers and 1 DB worker.")
-            yield
-    except aiomqtt.MqttError as e:
-        print(f"CRITICAL: Could not connect to MQTT broker: {e}.")
+        while not app_started:
+            try:
+                async with aiomqtt.Client(MQTT_BROKER, port=MQTT_PORT) as client:
+                    print(f"Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
+                    tasks.append(asyncio.create_task(batch_inserter()))
+                    for config in FILE_CONFIGS: tasks.append(asyncio.create_task(tail_file(config, client)))
+                    print(f"Launched {len(FILE_CONFIGS)} file tailers and 1 DB worker.")
+                    app_started = True
+                    yield
+            except aiomqtt.MqttError as e:
+                # At boot the EMQX container can take ~15s longer than this one.
+                if app_started:
+                    print(f"MQTT connection closed during shutdown: {e}")
+                else:
+                    print(f"MQTT broker not ready: {e}. Retrying in 5s...")
+                    await asyncio.sleep(5)
     finally:
         print("Shutting down... Cancelling background tasks.")
         for task in tasks: task.cancel()

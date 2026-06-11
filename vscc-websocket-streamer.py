@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,18 +42,23 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 # --- Helper: Normalize Timestamp ---
+# VSCapture timestamps are wall-clock time of the capture host, not UTC.
+MONITOR_TZ = ZoneInfo(os.getenv("MONITOR_TZ", "America/Los_Angeles"))
+
 def parse_vsc_timestamp(raw_time: str) -> datetime | None:
     """
-    Parses VSCapture timestamp string into a UTC datetime object.
+    Parses VSCapture's local-time timestamp string into a UTC datetime object.
     """
     if not raw_time:
         return None
     try:
         # Try parsing with microseconds first
-        return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S.%f").replace(tzinfo=timezone.utc)
+        return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S.%f").replace(tzinfo=MONITOR_TZ).astimezone(timezone.utc)
     except ValueError:
+        pass
+    try:
         # Fallback for timestamps without milliseconds
-        return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S").replace(tzinfo=timezone.utc)
+        return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S").replace(tzinfo=MONITOR_TZ).astimezone(timezone.utc)
     except ValueError:
         return None
 
