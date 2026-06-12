@@ -1,6 +1,9 @@
 import asyncio
 import json
 import os
+import re
+import tempfile
+from array import array
 from pathlib import Path
 from contextlib import asynccontextmanager
 import shutil
@@ -312,6 +315,13 @@ async def lifespan(app: FastAPI):
         await apply_retention(int((await get_settings())["retention_hours"]))
     except Exception as e:
         print(f"Could not apply persisted retention setting: {e}")
+    # Mirror persisted capture settings to the shared config file (survives
+    # volume recreation; no-op while the user never changed capture settings).
+    try:
+        if any(k.startswith("capture_") for k in await get_settings()):
+            _write_capture_config_file(await _capture_settings())
+    except Exception as e:
+        print(f"Could not write capture config file: {e}")
     
     tasks = []
     app_started = False
@@ -417,6 +427,81 @@ async def write_settings(payload: Dict[str, Any]):
             return {"ok": False, "error": f"settings saved but retention not applied: {e}"}
     return {"ok": True, **allowed}
 
+# --- 4b. Capture service configuration ---
+#
+# The dashboard edits these; the worker persists them in vscc_settings and
+# mirrors them to a plain key=value file on the shared /data volume. The
+# capture container re-reads the file before every launch and recycles the
+# running capture when it changes (data resumes within ~2 minutes: change
+# detection plus the monitor's association cool-down). The file is key=value
+# rather than JSON because the capture image only ships python3-minimal,
+# which has no json module — plain lines parse with sed/grep.
+
+CAPTURE_CONFIG_FILE = BASE_DIR / "vscc-capture-config.conf"
+CAPTURE_DEFAULTS = {
+    "monitor_ip": "",     # empty = keep the capture container's MONITOR_IP env
+    "interval": "1",      # numerics export interval, seconds
+    "waveset": "12",      # VSCapture waveform set (12 = all waves)
+    "scale": "2",
+    "devid": "mp50",      # device id used in export file names / MQTT topics
+}
+_IP_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+
+def _validate_capture(key: str, value: str) -> Optional[str]:
+    """Returns an error message, or None when the value is acceptable."""
+    if key == "monitor_ip":
+        if value == "":
+            return None
+        m = _IP_RE.match(value)
+        return None if m and all(int(o) <= 255 for o in m.groups()) else "monitor_ip must be an IPv4 address"
+    if key == "interval":
+        return None if value in ("1", "10", "60", "300") else "interval must be 1, 10, 60 or 300 (seconds)"
+    if key == "waveset":
+        return None if value.isdigit() and 0 <= int(value) <= 12 else "waveset must be 0-12"
+    if key == "scale":
+        return None if value in ("1", "2") else "scale must be 1 or 2"
+    if key == "devid":
+        return None if re.match(r"^[A-Za-z0-9_-]{1,32}$", value) else "devid must be 1-32 chars of [A-Za-z0-9_-]"
+    return "unknown key"
+
+async def _capture_settings() -> Dict[str, str]:
+    stored = await get_settings()
+    return {k: stored.get(f"capture_{k}", v) for k, v in CAPTURE_DEFAULTS.items()}
+
+def _write_capture_config_file(cfg: Dict[str, str]):
+    """Atomic write (tmp + rename) so the capture's watcher never sees a torn file."""
+    content = "".join(f"{k}={v}\n" for k, v in cfg.items() if v != "")
+    CAPTURE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CAPTURE_CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(content)
+    os.replace(tmp, CAPTURE_CONFIG_FILE)
+
+@app.get("/api/capture-config")
+async def read_capture_config():
+    cfg = await _capture_settings()
+    return {**cfg, "config_file": str(CAPTURE_CONFIG_FILE)}
+
+@app.put("/api/capture-config")
+async def write_capture_config(payload: Dict[str, Any]):
+    updates = {k: str(payload[k]).strip() for k in CAPTURE_DEFAULTS if k in payload}
+    if not updates:
+        return {"ok": False, "error": "nothing to update"}
+    for k, v in updates.items():
+        err = _validate_capture(k, v)
+        if err:
+            return {"ok": False, "error": err}
+    async with db_pool.acquire() as conn:
+        for k, v in updates.items():
+            await conn.execute(
+                "INSERT INTO vscc_settings (key, value) VALUES ($1, $2) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", f"capture_{k}", v)
+    cfg = await _capture_settings()
+    try:
+        _write_capture_config_file(cfg)
+    except Exception as e:
+        return {"ok": False, "error": f"settings saved but config file not written: {e}"}
+    return {"ok": True, **cfg}
+
 # --- 5. Sessions: auto-managed recording ranges over the data-time axis ---
 
 async def session_manager():
@@ -508,7 +593,7 @@ async def session_data(session_id: int, max_raw_minutes: int = 15):
                 "WHERE bucket BETWEEN $1 AND $2 ORDER BY bucket", r["started_at"], end)
         else:
             waveforms = await conn.fetch(
-                "SELECT time, physio_id, value FROM patient_waveforms WHERE time BETWEEN $1 AND $2 ORDER BY time",
+                "SELECT time, physio_id, value FROM patient_waveforms WHERE time BETWEEN $1 AND $2 ORDER BY time, ctid",
                 r["started_at"], end)
     fmt = lambda rows: [{"time": x["time"].timestamp(), "physio_id": x["physio_id"], "value": float(x["value"])} for x in rows]
     return {"session": _session_dict(r), "aggregated_waveforms": aggregated,
@@ -522,6 +607,10 @@ def _parquet_available() -> bool:
         return False
 
 EXPORT_BATCH = 50_000  # rows per cursor prefetch / parquet batch
+
+def _session_package_dir(r) -> Path:
+    slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in (r["label"] or "session"))[:60].strip("-") or "session"
+    return SESSIONS_DIR / f"{r['started_at'].strftime('%Y%m%d-%H%M')}_{r['id']}_{slug}"
 
 async def _export_session_files(session_id: int) -> Dict[str, Any]:
     """Write session.json + numerics/waveforms CSV (and Parquet when pyarrow is
@@ -538,8 +627,7 @@ async def _export_session_files(session_id: int) -> Dict[str, Any]:
             return {"ok": False, "error": "not found"}
         end = r["ended_at"] or datetime.now(timezone.utc)
 
-        slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in (r["label"] or "session"))[:60].strip("-") or "session"
-        out = SESSIONS_DIR / f"{r['started_at'].strftime('%Y%m%d-%H%M')}_{r['id']}_{slug}"
+        out = _session_package_dir(r)
         out.mkdir(parents=True, exist_ok=True)
 
         files, counts = [], {}
@@ -550,12 +638,15 @@ async def _export_session_files(session_id: int) -> Dict[str, Any]:
                 schema = pa.schema([("time_utc", pa.timestamp("us", tz="UTC")),
                                     ("physio_id", pa.string()), ("value", pa.float64())])
                 writer = pq.ParquetWriter(out / f"{name}.parquet", schema)
+            # Waveform frames share one millisecond stamp; ctid keeps intra-frame
+            # samples in the order VSCapture wrote them (see EDF export note).
+            order = "time, ctid" if table == "patient_waveforms" else "time"
             with open(out / f"{name}.csv", "w") as f:
                 f.write("time_utc,physio_id,value\n")
                 batch = []
                 async with conn.transaction():
                     async for x in conn.cursor(
-                            f"SELECT time, physio_id, value FROM {table} WHERE time BETWEEN $1 AND $2 ORDER BY time",
+                            f"SELECT time, physio_id, value FROM {table} WHERE time BETWEEN $1 AND $2 ORDER BY {order}",
                             r["started_at"], end, prefetch=EXPORT_BATCH):
                         f.write(f"{x['time'].isoformat()},{x['physio_id']},{x['value']}\n")
                         count += 1
@@ -577,11 +668,12 @@ async def _export_session_files(session_id: int) -> Dict[str, Any]:
                     files.append(f"{name}.parquet")
             files.append(f"{name}.csv")
             counts[name] = count
+        quality = await _compute_quality(conn, r["started_at"], end)
 
     with open(out / "session.json", "w") as f:
         json.dump({**_session_dict(r), "exported_at": datetime.now(timezone.utc).isoformat(),
                    "numeric_rows": counts["numerics"], "waveform_rows": counts["waveforms"],
-                   "time_format": "ISO 8601 UTC"}, f, indent=2)
+                   "time_format": "ISO 8601 UTC", "quality": quality}, f, indent=2)
     files.insert(0, "session.json")
     return {"ok": True, "path": str(out), "files": files,
             "numeric_rows": counts["numerics"], "waveform_rows": counts["waveforms"]}
@@ -660,3 +752,213 @@ async def session_signals(session_id: int):
             r["started_at"], end)
     return {"numerics": [x["physio_id"] for x in nums],
             "waveforms": [x["physio_id"] for x in waves]}
+
+# --- 6. Capture quality / loss statistics ---
+#
+# Waveform timestamps arrive frame-stamped: a whole UDP frame of samples shares
+# one millisecond stamp (e.g. ECG bursts of 192 rows per ms), so sub-second
+# spacing carries no timing information. Per-second sample counts ARE stable
+# (ECG 768/s, Pleth 128/s, Resp 64/s on the MP50), so the nominal rate is the
+# statistical mode of per-second counts and loss is measured against
+# rate x active span. Numerics get plain counts only — many are intermittent
+# by design (NIBP only on inflation), so "expected" would be meaningless.
+
+QUALITY_WAVE_SQL = """
+WITH b AS (
+    SELECT physio_id, time_bucket('1 second', time) AS sec, count(*) AS n
+    FROM patient_waveforms WHERE time BETWEEN $1 AND $2
+    GROUP BY 1, 2
+), g AS (
+    SELECT physio_id, sec, n,
+           EXTRACT(EPOCH FROM sec - lag(sec) OVER (PARTITION BY physio_id ORDER BY sec)) AS step
+    FROM b
+)
+SELECT physio_id,
+       sum(n)::bigint                                     AS samples,
+       count(*)::bigint                                   AS seconds_with_data,
+       mode() WITHIN GROUP (ORDER BY n)                   AS rate_hz,
+       min(sec)                                           AS first_sec,
+       max(sec)                                           AS last_sec,
+       count(*) FILTER (WHERE step > 1)                   AS gap_count,
+       COALESCE(max(step) FILTER (WHERE step > 1) - 1, 0) AS longest_gap_s
+FROM g GROUP BY physio_id ORDER BY physio_id
+"""
+
+async def _compute_quality(conn, started_at, end) -> Dict[str, Any]:
+    waves = []
+    for r in await conn.fetch(QUALITY_WAVE_SQL, started_at, end):
+        span_s = int((r["last_sec"] - r["first_sec"]).total_seconds()) + 1
+        expected = int(r["rate_hz"]) * span_s
+        waves.append({
+            "physio_id": r["physio_id"],
+            "rate_hz": int(r["rate_hz"]),
+            "samples": int(r["samples"]),
+            "expected_samples": expected,
+            "missing_samples": max(0, expected - int(r["samples"])),
+            "completeness_pct": round(100.0 * int(r["samples"]) / expected, 2) if expected else None,
+            "gap_count": int(r["gap_count"]),
+            "longest_gap_s": float(r["longest_gap_s"]),
+            "first_sample": r["first_sec"].timestamp(),
+            "last_sample": r["last_sec"].timestamp() + 1,
+        })
+    nums = await conn.fetch(
+        "SELECT physio_id, count(*) AS samples, min(time) AS first, max(time) AS last "
+        "FROM patient_numerics WHERE time BETWEEN $1 AND $2 GROUP BY physio_id ORDER BY physio_id",
+        started_at, end)
+    return {"waveforms": waves,
+            "numerics": [{"physio_id": x["physio_id"], "samples": int(x["samples"]),
+                          "first_sample": x["first"].timestamp(), "last_sample": x["last"].timestamp()}
+                         for x in nums]}
+
+@app.get("/api/sessions/{session_id}/quality")
+async def session_quality(session_id: int):
+    """Loss statistics: per-waveform expected vs actual samples, gaps, rates."""
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
+        if not r:
+            return {"error": "not found"}
+        end = r["ended_at"] or datetime.now(timezone.utc)
+        quality = await _compute_quality(conn, r["started_at"], end)
+    return {"session": _session_dict(r), **quality}
+
+# --- 7. EDF export ---
+#
+# One EDF channel per waveform signal. Because timestamps are frame-stamped
+# (see section 6), samples are placed on a per-second grid at the signal's
+# nominal rate: each second's samples fill that second's slot in arrival
+# order, short seconds are zero-padded, empty seconds stay zero — so channel
+# alignment never drifts and gaps are preserved in place. Values are scaled
+# symmetrically (digital 0 == physical 0) so the zero gap-filler is honest.
+# Channels stream from DB cursors into sparse temp files, then interleave
+# into EDF records — memory stays flat for GB sessions.
+
+EDF_DIG_MAX = 32767
+
+def _edf_ascii(value, width: int) -> bytes:
+    """Fixed-width space-padded ASCII header field."""
+    s = str(value)[:width]
+    return s.ljust(width).encode("ascii", "replace")
+
+def _edf_num(value: float, width: int) -> bytes:
+    """Numeric header field squeezed into width chars."""
+    for fmt in ("%g", "%.5g", "%.4g", "%.3g", "%.2g"):
+        s = fmt % value
+        if len(s) <= width:
+            return s.ljust(width).encode("ascii")
+    return ("%.1e" % value)[:width].ljust(width).encode("ascii")
+
+def _edf_flush_second(f, sec_idx: Optional[int], n_records: int, spr: int, buf: List[int]):
+    if sec_idx is None or not (0 <= sec_idx < n_records):
+        return
+    vals = (buf + [0] * spr)[:spr]  # pad short seconds, trim overfull ones
+    f.seek(sec_idx * spr * 2)
+    f.write(array("h", vals).tobytes())
+
+async def _export_session_edf(session_id: int) -> Dict[str, Any]:
+    """Build <package>/waveforms.edf, regenerated fresh on every call."""
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
+        if not r:
+            return {"ok": False, "error": "not found"}
+        end = r["ended_at"] or datetime.now(timezone.utc)
+
+        chans = []
+        for q in await conn.fetch(QUALITY_WAVE_SQL, r["started_at"], end):
+            lim = await conn.fetchrow(
+                "SELECT min(value) AS vmin, max(value) AS vmax FROM patient_waveforms "
+                "WHERE physio_id = $1 AND time BETWEEN $2 AND $3",
+                q["physio_id"], r["started_at"], end)
+            pabs = max(abs(lim["vmin"]), abs(lim["vmax"]), 1e-9)
+            chans.append({"physio_id": q["physio_id"], "spr": int(q["rate_hz"]),
+                          "first_sec": q["first_sec"], "last_sec": q["last_sec"], "pabs": pabs})
+        if not chans:
+            return {"ok": False, "error": "session has no waveform data"}
+
+        t0 = min(c["first_sec"] for c in chans)
+        t0_epoch = int(t0.timestamp())
+        n_records = int(max(c["last_sec"] for c in chans).timestamp()) - t0_epoch + 1
+
+        out = _session_package_dir(r)
+        out.mkdir(parents=True, exist_ok=True)
+        edf_path = out / "waveforms.edf"
+
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(SESSIONS_DIR)) as tmpdir:
+            for i, ch in enumerate(chans):
+                scale = EDF_DIG_MAX / ch["pabs"]
+                ch["tmp"] = Path(tmpdir) / f"ch{i}.raw"
+                with open(ch["tmp"], "wb") as f:
+                    f.truncate(n_records * ch["spr"] * 2)  # sparse: unwritten == digital 0 == physical 0
+                    sec_idx, buf = None, []
+                    async with conn.transaction():
+                        # A whole VSCapture frame shares one millisecond stamp, so
+                        # ORDER BY time alone leaves intra-frame sample order to the
+                        # planner. ctid breaks ties in insertion order == the order
+                        # VSCapture wrote the samples (rows are never updated).
+                        async for x in conn.cursor(
+                                "SELECT time, value FROM patient_waveforms "
+                                "WHERE physio_id = $1 AND time BETWEEN $2 AND $3 ORDER BY time, ctid",
+                                ch["physio_id"], r["started_at"], end, prefetch=EXPORT_BATCH):
+                            idx = int(x["time"].timestamp()) - t0_epoch
+                            if idx != sec_idx:
+                                _edf_flush_second(f, sec_idx, n_records, ch["spr"], buf)
+                                sec_idx, buf = idx, []
+                            v = int(round(x["value"] * scale))
+                            buf.append(max(-EDF_DIG_MAX, min(EDF_DIG_MAX, v)))
+                    _edf_flush_second(f, sec_idx, n_records, ch["spr"], buf)
+
+            ns = len(chans)
+            with open(edf_path, "wb") as o:
+                o.write(_edf_ascii("0", 8))                                       # version
+                o.write(_edf_ascii(r["subject_code"] or "X", 80))                 # patient (anonymous)
+                o.write(_edf_ascii(f"VSCC session {r['id']} (times UTC) {r['label']}", 80))
+                o.write(_edf_ascii(t0.strftime("%d.%m.%y"), 8))
+                o.write(_edf_ascii(t0.strftime("%H.%M.%S"), 8))
+                o.write(_edf_ascii(256 * (ns + 1), 8))                            # header bytes
+                o.write(_edf_ascii("", 44))                                       # reserved (plain EDF)
+                o.write(_edf_ascii(n_records, 8))
+                o.write(_edf_ascii(1, 8))                                         # record duration, s
+                o.write(_edf_ascii(ns, 4))
+                for c in chans:
+                    pid = c["physio_id"]
+                    o.write(_edf_ascii(pid[4:] if pid.startswith("NOM_") else pid, 16))
+                for c in chans: o.write(_edf_ascii("", 80))                       # transducer
+                for c in chans: o.write(_edf_ascii("", 8))                        # physical dimension (monitor units)
+                for c in chans: o.write(_edf_num(-c["pabs"], 8))
+                for c in chans: o.write(_edf_num(c["pabs"], 8))
+                for c in chans: o.write(_edf_ascii(-EDF_DIG_MAX, 8))
+                for c in chans: o.write(_edf_ascii(EDF_DIG_MAX, 8))
+                for c in chans: o.write(_edf_ascii("", 80))                       # prefiltering
+                for c in chans: o.write(_edf_ascii(c["spr"], 8))
+                for c in chans: o.write(_edf_ascii("", 32))                       # reserved
+                handles = [open(c["tmp"], "rb") for c in chans]
+                try:
+                    for _ in range(n_records):
+                        for h, c in zip(handles, chans):
+                            o.write(h.read(c["spr"] * 2))
+                finally:
+                    for h in handles:
+                        h.close()
+
+    return {"ok": True, "path": str(edf_path), "n_records": n_records,
+            "start_utc": t0.isoformat(),
+            "channels": [{"physio_id": c["physio_id"], "rate_hz": c["spr"]} for c in chans]}
+
+@app.get("/api/sessions/{session_id}/edf")
+async def download_session_edf(session_id: int):
+    """Waveforms as EDF for EEG/biosignal toolchains (EDFbrowser, MNE, ...)."""
+    result = await _export_session_edf(session_id)
+    if not result.get("ok"):
+        return result
+    path = Path(result["path"])
+
+    def _iter():
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                yield chunk
+
+    return StreamingResponse(_iter(), media_type="application/octet-stream",
+                             headers={"Content-Disposition": f'attachment; filename="{path.parent.name}.edf"'})
