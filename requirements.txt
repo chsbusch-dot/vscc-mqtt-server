@@ -6,3 +6,4 @@ aiomqtt
 uvicorn
 tzdata
 pyarrow
+zipstream-ng
