@@ -7,3 +7,4 @@ uvicorn
 tzdata
 pyarrow
 zipstream-ng
+prometheus-client

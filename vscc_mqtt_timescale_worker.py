@@ -10,12 +10,15 @@ import shutil
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Union, List, Dict, Any, Optional
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import aiofiles
 import asyncpg
 import aiomqtt
+from prometheus_client import (
+    CollectorRegistry, Gauge, generate_latest, CONTENT_TYPE_LATEST,
+)
 
 # --- Configuration ---
 
@@ -83,6 +86,52 @@ db_pool = None
 # Drives the auto-session manager.
 last_data_time = None
 
+# --- Observability state (process-lifetime, in-memory) ---
+WORKER_START = None                                    # set in lifespan
+inserted_totals = {"patient_numerics": 0, "patient_waveforms": 0}
+# Per-source (DeviceID) integrity: clock offset, sequence tracking, liveness.
+source_state: Dict[str, Dict[str, Any]] = {}
+# Capture liveness thresholds (waveforms keep last_data_time sub-second fresh
+# while capturing, so these detect a stalled/stopped capture regardless of the
+# numerics interval).
+CAPTURE_STALL_S = 15
+CAPTURE_OFFLINE_S = 120
+
+def _capture_state(now: datetime):
+    if last_data_time is None:
+        return "no_data", None
+    age = (now - last_data_time).total_seconds()
+    if age <= CAPTURE_STALL_S:
+        return "live", age
+    if age <= CAPTURE_OFFLINE_S:
+        return "stalled", age
+    return "offline", age
+
+def _track_source_integrity(record: Dict[str, Any]):
+    """Per-source data-integrity signals, derived purely from the export record:
+    - clock offset = host wall-clock stamp (SystemLocalTime) minus monitor
+      device stamp (Timestamp): timestamp uncertainty between source and capture.
+    - sequence regression = the monitor's monotonic Relativetimestamp going
+      backwards, which flags a capture restart / new association."""
+    device = record.get("DeviceID") or "unknown"
+    st = source_state.setdefault(device, {
+        "clock_offset_s": None, "sequence_regressions": 0,
+        "last_relativetimestamp": None, "last_seen": None, "samples": 0})
+    st["samples"] += 1
+    st["last_seen"] = datetime.now(timezone.utc)
+    mono = parse_vsc_timestamp(record.get("Timestamp"))
+    host = parse_vsc_timestamp(record.get("SystemLocalTime"))
+    if mono and host:
+        st["clock_offset_s"] = (host - mono).total_seconds()
+    try:
+        rel = int(record.get("Relativetimestamp"))
+        prev = st["last_relativetimestamp"]
+        if prev is not None and rel < prev:
+            st["sequence_regressions"] += 1
+        st["last_relativetimestamp"] = rel
+    except (ValueError, TypeError):
+        pass
+
 SESSIONS_DIR = Path(os.getenv("SESSIONS_DIR", "/sessions"))
 DEFAULT_SETTINGS = {
     "retention_hours": "12",
@@ -119,8 +168,10 @@ async def batch_inserter():
             async with db_pool.acquire() as connection:
                 if numerics_to_insert:
                     await connection.executemany("INSERT INTO patient_numerics (time, physio_id, value) VALUES ($1, $2, $3)", numerics_to_insert)
+                    inserted_totals["patient_numerics"] += len(numerics_to_insert)
                 if waveforms_to_insert:
                     await connection.executemany("INSERT INTO patient_waveforms (time, physio_id, value) VALUES ($1, $2, $3)", waveforms_to_insert)
+                    inserted_totals["patient_waveforms"] += len(waveforms_to_insert)
             global last_data_time
             newest = max((row[0] for row in numerics_to_insert + waveforms_to_insert), default=None)
             if newest and (last_data_time is None or newest > last_data_time):
@@ -192,6 +243,7 @@ async def tail_file(config: Dict[str, Any], client: aiomqtt.Client):
                             data_array = json.loads(line)
                             if isinstance(data_array, dict): data_array = [data_array]
                             for record in data_array:
+                                _track_source_integrity(record)
                                 val_str = record.get("Value", "-")
                                 if val_str == "-": continue
                                 try: value_float = float(val_str)
@@ -300,7 +352,8 @@ async def ensure_schema(pool):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db_pool
+    global db_pool, WORKER_START
+    WORKER_START = datetime.now(timezone.utc)
     while True:
         try:
             db_pool = await asyncpg.create_pool(DB_DSN)
@@ -332,11 +385,12 @@ async def lifespan(app: FastAPI):
                     print(f"Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
                     tasks.append(asyncio.create_task(batch_inserter()))
                     tasks.append(asyncio.create_task(session_manager()))
+                    tasks.append(asyncio.create_task(gap_watchdog()))
                     # Numerics: one fixed JSON tailer (carries every parameter PhysioID).
                     tasks.append(asyncio.create_task(tail_file(NUMERICS_CONFIG, client)))
                     # Waveforms: discovered dynamically so new modules stream with no code change.
                     tasks.append(asyncio.create_task(wave_discovery_loop(client, set())))
-                    print("Launched numerics tailer + waveform auto-discovery + DB batch worker.")
+                    print("Launched numerics tailer + waveform auto-discovery + DB batch worker + watchdog.")
                     app_started = True
                     yield
             except aiomqtt.MqttError as e:
@@ -502,6 +556,97 @@ async def write_capture_config(payload: Dict[str, Any]):
         return {"ok": False, "error": f"settings saved but config file not written: {e}"}
     return {"ok": True, **cfg}
 
+# --- 4c. Observability: status, Prometheus metrics, integrity report ---
+
+METRICS = CollectorRegistry()
+_G = lambda name, doc, labels=None: Gauge(name, doc, labels or [], registry=METRICS)
+M_last_age   = _G("vscc_last_data_age_seconds", "Seconds since the newest data point ingested")
+M_db_lag     = _G("vscc_db_lag_seconds", "Seconds between now and the newest row in patient_numerics")
+M_db_size    = _G("vscc_db_size_bytes", "TimescaleDB 'telemetry' database size")
+M_capture_up = _G("vscc_capture_up", "1 when capture is live (data within the stall threshold)")
+M_uptime     = _G("vscc_worker_uptime_seconds", "Worker process uptime")
+M_buffer     = _G("vscc_buffer_backlog_rows", "Rows buffered awaiting insert", ["kind"])
+M_inserted   = _G("vscc_inserted_rows_total", "Cumulative rows inserted this process-lifetime", ["table"])
+M_offset     = _G("vscc_source_clock_offset_seconds", "Host stamp minus monitor stamp, per source", ["device"])
+M_seq        = _G("vscc_source_sequence_regressions_total", "Monitor Relativetimestamp regressions, per source", ["device"])
+
+async def _refresh_metrics():
+    now = datetime.now(timezone.utc)
+    state, age = _capture_state(now)
+    M_last_age.set(age if age is not None else -1)
+    M_capture_up.set(1 if state == "live" else 0)
+    M_uptime.set((now - WORKER_START).total_seconds() if WORKER_START else 0)
+    M_buffer.labels(kind="numerics").set(len(numerics_buffer))
+    M_buffer.labels(kind="waveforms").set(len(waveforms_buffer))
+    for table, n in inserted_totals.items():
+        M_inserted.labels(table=table).set(n)
+    for dev, s in source_state.items():
+        if s["clock_offset_s"] is not None:
+            M_offset.labels(device=dev).set(s["clock_offset_s"])
+        M_seq.labels(device=dev).set(s["sequence_regressions"])
+    try:
+        async with db_pool.acquire() as conn:
+            db_max = await conn.fetchval("SELECT max(time) FROM patient_numerics")
+            db_size = await conn.fetchval("SELECT pg_database_size('telemetry')")
+        M_db_lag.set((now - db_max).total_seconds() if db_max else -1)
+        M_db_size.set(db_size or 0)
+    except Exception as e:
+        print(f"metrics db refresh failed: {e}")
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus exposition — scrape target for capture state, last-data age,
+    DB lag/size, per-source clock offset and sequence regressions."""
+    await _refresh_metrics()
+    return Response(generate_latest(METRICS), media_type=CONTENT_TYPE_LATEST)
+
+def _sources_view(now: datetime) -> Dict[str, Any]:
+    return {dev: {
+        "clock_offset_seconds": s["clock_offset_s"],
+        "sequence_regressions": s["sequence_regressions"],
+        "samples_seen": s["samples"],
+        "last_seen_age_seconds": (now - s["last_seen"]).total_seconds() if s["last_seen"] else None,
+    } for dev, s in source_state.items()}
+
+@app.get("/api/status")
+async def status():
+    """Health snapshot for dashboards/monitoring: capture state, last-data age,
+    DB lag, buffer backlog, per-source integrity."""
+    now = datetime.now(timezone.utc)
+    state, age = _capture_state(now)
+    db_lag = db_size = None
+    try:
+        async with db_pool.acquire() as conn:
+            db_max = await conn.fetchval("SELECT max(time) FROM patient_numerics")
+            db_size = await conn.fetchval("SELECT pg_database_size('telemetry')")
+        db_lag = (now - db_max).total_seconds() if db_max else None
+    except Exception as e:
+        print(f"status db query failed: {e}")
+    return {
+        "capture_state": state,
+        "last_data_age_seconds": age,
+        "db_lag_seconds": db_lag,
+        "db_size_bytes": db_size,
+        "worker_uptime_seconds": (now - WORKER_START).total_seconds() if WORKER_START else None,
+        "buffer_backlog": {"numerics": len(numerics_buffer), "waveforms": len(waveforms_buffer)},
+        "inserted_total": dict(inserted_totals),
+        "sources": _sources_view(now),
+        "thresholds": {"stall_s": CAPTURE_STALL_S, "offline_s": CAPTURE_OFFLINE_S},
+    }
+
+@app.get("/api/integrity")
+async def integrity_report():
+    """Live per-source data-integrity report: clock offset (host SystemLocalTime
+    minus monitor Timestamp — timestamp uncertainty between source and capture)
+    and sequence regressions (monitor counter going backwards = capture restart).
+    Per-session data-loss statistics live under /api/sessions/{id}/quality."""
+    now = datetime.now(timezone.utc)
+    return {
+        "generated_at": now.isoformat(),
+        "clock_offset_note": "host SystemLocalTime minus monitor Timestamp, seconds",
+        "sources": _sources_view(now),
+    }
+
 # --- 5. Sessions: auto-managed recording ranges over the data-time axis ---
 
 async def session_manager():
@@ -532,6 +677,20 @@ async def session_manager():
                     print(f"[Sessions] Closed session #{open_row['id']} (data gap)")
         except Exception as e:
             print(f"[Sessions] manager error: {e}")
+
+async def gap_watchdog():
+    """Logs capture-liveness transitions (live → stalled → offline and back).
+    Notification = log + reflected in /api/status; this never alarms (the system
+    is research/education only and must not be used for clinical alerting)."""
+    prev = "init"
+    while True:
+        await asyncio.sleep(10)
+        now = datetime.now(timezone.utc)
+        state, age = _capture_state(now)
+        if state != prev:
+            detail = f" (no data for {age:.0f}s)" if age is not None else ""
+            print(f"[Watchdog] capture {prev} -> {state}{detail}")
+            prev = state
 
 def _session_dict(r) -> Dict[str, Any]:
     return {"id": r["id"], "label": r["label"], "subject_code": r["subject_code"],
@@ -725,15 +884,35 @@ async def download_all_sessions():
 
 @app.post("/api/sessions")
 async def create_session(payload: Optional[Dict[str, Any]] = None):
-    """Manual 'New Session': closes any open session at the boundary and starts
-    recording into a fresh one (incoming data keeps flowing; only the session
-    metadata boundary moves)."""
+    """Manual named 'Start session': closes any open session at the boundary and
+    starts recording into a fresh one with optional metadata (label, subject_code,
+    notes). Incoming data keeps flowing; only the session metadata boundary moves."""
+    payload = payload or {}
     now = datetime.now(timezone.utc)
-    label = (payload or {}).get("label") or f"Session {now.strftime('%Y-%m-%d %H:%M')}"
+    label = payload.get("label") or f"Session {now.strftime('%Y-%m-%d %H:%M')}"
+    subject = str(payload.get("subject_code", ""))
+    notes = str(payload.get("notes", ""))
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE sessions SET ended_at = GREATEST($1, started_at) WHERE ended_at IS NULL", now)
         r = await conn.fetchrow(
-            "INSERT INTO sessions (label, started_at) VALUES ($1, $2) RETURNING *", label, now)
+            "INSERT INTO sessions (label, subject_code, notes, started_at) VALUES ($1, $2, $3, $4) RETURNING *",
+            label, subject, notes, now)
+    return _session_dict(r)
+
+@app.post("/api/sessions/{session_id}/stop")
+async def stop_session(session_id: int):
+    """Explicit 'Stop recording': closes an open session now. Pairs with the
+    named start above; auto-close on data silence still applies as a fallback."""
+    now = datetime.now(timezone.utc)
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
+        if not r:
+            return {"ok": False, "error": "not found"}
+        if r["ended_at"] is not None:
+            return {"ok": False, "error": "session already stopped"}
+        r = await conn.fetchrow(
+            "UPDATE sessions SET ended_at = GREATEST($1, started_at) WHERE id = $2 RETURNING *",
+            now, session_id)
     return _session_dict(r)
 
 @app.get("/api/sessions/{session_id}/signals")

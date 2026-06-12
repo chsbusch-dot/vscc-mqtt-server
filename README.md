@@ -159,7 +159,8 @@ browser; the same API is available to scripts:
 | Endpoint | What it does |
 | --- | --- |
 | `GET /api/sessions` | List sessions (newest first) |
-| `POST /api/sessions` | Start a fresh session at the current boundary |
+| `POST /api/sessions` | Start a fresh named session (`label`, `subject_code`, `notes`) at the current boundary |
+| `POST /api/sessions/{id}/stop` | Explicitly stop recording an open session |
 | `PATCH /api/sessions/{id}` | Rename / set subject code / notes |
 | `DELETE /api/sessions/{id}` | Delete a closed session (+ its data rows) |
 | `GET /api/sessions/{id}/data` | Replay payload for the dashboard charts |
@@ -189,6 +190,38 @@ the running capture when it changes. **Applying a change restarts the capture �
 resumes within ~2 minutes** (change detection plus the monitor's association
 cool-down). Values in the file are validated on both ends; invalid entries fall back
 to the container's environment defaults.
+
+### Monitoring & data integrity (worker, :8001)
+
+| Endpoint | What it does |
+| --- | --- |
+| `GET /api/status` | Health snapshot: capture state (`live`/`stalled`/`offline`/`no_data`), last-data age, DB lag, DB size, buffer backlog, per-source integrity |
+| `GET /api/integrity` | Live per-source report: clock offset and sequence regressions |
+| `GET /metrics` | Prometheus exposition of the above |
+
+The worker tracks two **data-integrity** signals per source, derived purely from
+the export records (no extra wiring on the monitor):
+
+- **Clock offset** — host wall-clock stamp (`SystemLocalTime`) minus the monitor's
+  device stamp (`Timestamp`): the timestamp uncertainty between the source and the
+  capture host. On the test MP50 this runs ~80 s, so researchers know the absolute-time
+  error budget on stored samples.
+- **Sequence regressions** — the monitor's monotonic `Relativetimestamp` going
+  backwards, which flags a capture restart / new association (a likely data gap).
+
+Per-**session** data-loss statistics (expected vs actual samples, gaps) are under
+`GET /api/sessions/{id}/quality`. A background **gap watchdog** logs capture-liveness
+transitions (`live → stalled → offline`). All of this is observability only — the
+system is research/education software and never raises clinical alarms.
+
+Scrape with Prometheus:
+
+```yaml
+scrape_configs:
+  - job_name: vscc
+    static_configs:
+      - targets: ['<worker-host>:8001']
+```
 
 ## Directory Structure
 
