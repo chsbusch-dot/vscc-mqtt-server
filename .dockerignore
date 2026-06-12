@@ -9,21 +9,24 @@ __pycache__/
 # VSCapture binaries and data - this is mounted as a volume, not part of the image
 VSCapture/
 
-# Installer, helper scripts, and other non-worker scripts
+# Installer and host-only helper scripts
+# (vscc-file-cleanup.py and vscc-websocket-streamer.py stay IN the context —
+# the capture and streamer images COPY them)
 install.sh
 update.sh
 vscc-install-capture-cli.sh
 vscc-install-websocket-streamer.sh
-vscc-file-cleanup.py
-vscc-websocket-streamer.py
+vscc-capture-loop.sh
 
 # Docker and database setup files
 vscc-docker-compose.yml
+docker-compose.yml
 vscc-init-timescaledb.sql
 vscc-mosquitto.conf.bak
 
 # Documentation
 README.md
+docs/
 
-# The Dockerfile for this build should not be in the context
-vscc-worker.Dockerfile
+# Dockerfiles themselves are not needed inside any context
+*.Dockerfile

@@ -222,7 +222,51 @@ async def wave_discovery_loop(client: aiomqtt.Client, tailed_paths: set):
             print(f"Wave discovery error: {e}")
         await asyncio.sleep(10)
 
-# --- 3. App Lifespan & FastAPI ---
+# --- 3. Schema bootstrap, App Lifespan & FastAPI ---
+
+# Mirrors vscc-init-timescaledb.sql so the stack also runs without the init.sql
+# bind mount (single-file `docker compose up` install). Every statement is
+# idempotent; on an already-initialized database this is a no-op.
+SCHEMA_STATEMENTS = [
+    """CREATE TABLE IF NOT EXISTS patient_numerics (
+        time TIMESTAMPTZ NOT NULL,
+        physio_id TEXT NOT NULL,
+        value DOUBLE PRECISION NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS patient_waveforms (
+        time TIMESTAMPTZ NOT NULL,
+        physio_id TEXT NOT NULL,
+        value DOUBLE PRECISION NOT NULL
+    )""",
+    "SELECT create_hypertable('patient_numerics', 'time', if_not_exists => TRUE)",
+    "SELECT create_hypertable('patient_waveforms', 'time', if_not_exists => TRUE)",
+    """CREATE MATERIALIZED VIEW IF NOT EXISTS patient_waveforms_1min
+       WITH (timescaledb.continuous) AS
+       SELECT physio_id,
+              time_bucket('1 minute', time) AS bucket,
+              AVG(value) AS avg_value,
+              MIN(value) AS min_value,
+              MAX(value) AS max_value
+       FROM patient_waveforms
+       GROUP BY physio_id, bucket""",
+    """SELECT add_continuous_aggregate_policy('patient_waveforms_1min',
+        start_offset => INTERVAL '1 hour',
+        end_offset   => INTERVAL '1 minute',
+        schedule_interval => INTERVAL '5 minutes',
+        if_not_exists => TRUE)""",
+    "SELECT add_retention_policy('patient_numerics', INTERVAL '12 hours', if_not_exists => TRUE)",
+    "SELECT add_retention_policy('patient_waveforms', INTERVAL '12 hours', if_not_exists => TRUE)",
+]
+
+async def ensure_schema(pool):
+    async with pool.acquire() as connection:
+        for stmt in SCHEMA_STATEMENTS:
+            try:
+                await connection.execute(stmt)
+            except Exception as e:
+                print(f"Schema bootstrap statement failed (continuing): {e}")
+    print("Database schema verified.")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool
@@ -234,6 +278,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"Database connection failed: {e}. Retrying in 5s...")
             await asyncio.sleep(5)
+    await ensure_schema(db_pool)
     
     tasks = []
     app_started = False

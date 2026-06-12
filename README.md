@@ -28,8 +28,25 @@ frontend — a React + SciChart dashboard rendering the live waveforms and vital
 
 ## Quick Start
 
-Prerequisites: a Debian/Ubuntu host with `git` and Docker (Compose V2). If either is
-missing, `install.sh` detects it and offers to install them for you (with confirmation).
+All you need is Docker (Compose V2) — on Linux, macOS (Docker Desktop), Windows
+(Docker Desktop or WSL2), or a Raspberry Pi. The entire stack — capture, broker,
+database, APIs, dashboard — runs from one file using prebuilt images:
+
+```bash
+curl -O https://raw.githubusercontent.com/chsbusch-dot/vscc-mqtt-server/main/docker-compose.yml
+MONITOR_IP=192.168.1.215 docker compose up -d     # your monitor's IP
+```
+
+Then open `http://<this-host>/` in a browser and press PLAY LIVE. The capture
+waits politely while the monitor is off and starts streaming within seconds of
+it being powered on. (LAN capture mode only; serial/MIB needs a native install.)
+
+### Alternative: systemd-native install (Linux)
+
+Runs the capture and streamer as systemd services instead of containers —
+useful if you prefer journald logging and host-level control. Needs a
+Debian/Ubuntu host; `install.sh` offers to install missing tools (git, Docker)
+with confirmation.
 
 ```bash
 # 1. Backend: capture + broker + database (prompts for your monitor's IP)
