@@ -38,5 +38,17 @@ services:
       - ./VSCapture:/app/VSCapture
     restart: unless-stopped
 
+  # Optional: serve the React dashboard from this host (single-host install).
+  # Requires the client repo checked out as a sibling directory:
+  #   git clone git@github.com:chsbusch-dot/vscc-dashboard-client.git ../vscc-dashboard-client
+  # Start with: docker compose -f vscc-docker-compose.yml --profile dashboard up -d --build
+  dashboard:
+    profiles: ["dashboard"]
+    build:
+      context: ../vscc-dashboard-client
+    ports:
+      - "80:80"
+    restart: unless-stopped
+
 volumes:
   timescaledb_data:

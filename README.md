@@ -1,6 +1,11 @@
 # vscc-mqtt-server: Backend Infrastructure for Medical Telemetry
 
-This directory contains the complete backend infrastructure for capturing, storing, and streaming data from a Philips MP50 patient monitor. It uses Docker and `systemd` to create a robust, manageable system. The matching real-time charting client lives in the [VSCapture-Dashboard](https://github.com/chsbusch-dot/VSCapture-Dashboard) repo (React + SciChart; connects via MQTT-over-WebSocket on port 8083 or the streamer on port 8000).
+This directory contains the complete backend infrastructure for capturing, storing, and streaming data from a Philips MP50 patient monitor. It uses Docker and `systemd` to create a robust, manageable system. The matching real-time charting client lives in the [vscc-dashboard-client](https://github.com/chsbusch-dot/vscc-dashboard-client) repo (React + SciChart; connects via MQTT-over-WebSocket on port 8083 or the streamer on port 8000).
+
+> **Research and education use only — not a medical device.** This software is not
+> cleared or approved for clinical use and must never be used for patient
+> monitoring, alarming, or any clinical decision-making. A certified monitor
+> remains the source of truth at all times.
 
 ## System Architecture
 
@@ -18,7 +23,7 @@ Philips MP50 ──UDP──► VSCaptureCLI ──► export files (JSON numeri
                                    :8083 ws)  ▲
                                       │       │ /api/historic/{minutes}
                                       ▼       │ (worker FastAPI, :8001)
-                                 React Dashboard (VSCapture-Dashboard repo)
+                                 React Dashboard (vscc-dashboard-client repo)
 ```
 
 1.  **VSCapture CLI (`systemd` service `vscc-capture-cli`):** A .NET application that connects to the patient monitor and writes raw telemetry to export files in `VSCapture/`. It runs under a keep-alive wrapper (repo file `vscc-capture-loop.sh`, installed by `install.sh` as `VSCapture/vscc-loop.sh`) that pings the monitor before launching and restarts the capture automatically when the monitor goes offline or the UDP connection times out — the service never enters a failed state while waiting for the monitor. The wrapper also handles the MP50's single-association limit: a silent-hang watchdog recycles a capture that runs without producing data (stale association), and abrupt stops are time-stamped so the next start waits out the monitor's ~90 s association timeout. Net effect: `systemctl restart vscc-capture-cli` is always safe; expect up to ~90 s before data resumes.
@@ -100,6 +105,13 @@ Manual control:
 cd ~/vscc-mqtt-server
 docker compose -f vscc-docker-compose.yml up -d        # broker, DB, worker
 sudo systemctl start vscc-capture-cli vscc-websocket-streamer
+```
+
+Serve the dashboard from this host too (single-host install — UI at `http://<host>/`):
+
+```bash
+git clone git@github.com:chsbusch-dot/vscc-dashboard-client.git ../vscc-dashboard-client
+docker compose -f vscc-docker-compose.yml --profile dashboard up -d --build
 ```
 
 After editing code:
