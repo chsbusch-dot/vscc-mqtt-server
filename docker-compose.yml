@@ -41,6 +41,7 @@ services:
     environment:
       MONITOR_IP: ${MONITOR_IP:?Set MONITOR_IP to the monitor IP, e.g. MONITOR_IP=192.168.1.215 docker compose up -d}
       WAVESET: ${WAVESET:-12}
+      TZ: UTC   # capture stamps exports in this TZ; the worker (MONITOR_TZ) must match
     volumes:
       - vscc-data:/data
     restart: unless-stopped
@@ -54,7 +55,11 @@ services:
     environment:
       DB_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-password}@timescaledb:5432/telemetry
       MQTT_BROKER: emqx
-      MONITOR_TZ: ${MONITOR_TZ:-America/Los_Angeles}
+      # The capture CONTAINER runs in UTC (TZ: UTC above), so its export
+      # timestamps are UTC and the worker must read them as UTC. Do NOT set this
+      # to a local zone — that double-counts the offset (stores hours in the
+      # future). Timestamps are stored UTC; the dashboard localizes per viewer.
+      MONITOR_TZ: UTC
       VSC_DATA_DIR: /data
     volumes:
       - vscc-data:/data
