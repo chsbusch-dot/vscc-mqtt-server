@@ -129,38 +129,49 @@ Remaining, in order:
 
 ### MQTT server / backend
 **Data & sessions**
-- Recording sessions: named start/stop with metadata (case ID, subject code,
-  notes); session list API.
-- Annotation API: timestamped event markers (drug given, position change,
-  stimulus) — essential for research analysis.
-- Gap detection + integrity report: sequence tracking, per-signal data-loss
-  statistics, clock-offset report per source.
+- ✅ **Shipped** — Recording sessions: named start/stop with metadata (case ID,
+  subject code, notes); session list API.
+- ✅ **Shipped** — Annotation API: timestamped event markers (drug given, position
+  change, stimulus).
+- ✅ **Shipped** — Gap detection + integrity report: sequence tracking, per-signal
+  data-loss statistics, clock-offset report per source.
 - TimescaleDB continuous aggregates (1 s / 1 min rollups), compression policies,
-  configurable retention per signal class.
-- Export API: EDF / Parquet / CSV / VitalDB by time range or session.
+  configurable retention per signal class. *(1-min aggregate shipped; rest pending.)*
+- ✅ **Shipped** — Export API: EDF / Parquet / CSV by time range or session.
+  *(VitalDB format still pending.)*
 - Import/backfill: VitalDB files, CSVs from other tools.
-- Replay service: re-publish any stored session over MQTT at 1×/N× speed
-  (demo mode, teaching, dashboard development).
+- ✅ **Shipped** — Replay service: virtual-monitor demo mode (re-publishes a
+  recorded session through the real pipeline; no hardware).
 
 **Capture & devices**
-- Alarm/event capture from the monitor (IntelliVue exports alarms; current
-  pipeline ignores them) — display + log only, never alerting.
+- ❌ **Not possible without a VSCapture patch** — Alarm/event capture. VSCapture's
+  export stream contains NO alarm data (no alarm fields in the numerics JSON, no
+  alarm strings in the raw protocol dump, no alarm export files); the IntelliVue
+  protocol carries alarms but VSCaptureCLI never reads them, and its source is not
+  public. Surfacing alarms needs a VSCapture decompile-patch (Phase 3 territory),
+  not a pipeline parser. Confirmed 2026-06-12.
+- ✅ **Shipped** — Dashboard-managed capture config (monitor IP, interval, waveset,
+  scale, devid) with live recycle.
 - Multi-device topic namespacing: `site/bed/device/signal`.
 - Device registry with per-device timezone, labels, expected signals.
 
 **Operations & security**
 - EMQX authentication + TLS (per-client credentials) — required beyond the LAN.
-- Prometheus metrics + status endpoint (capture state, last-data age, DB lag).
-- Watchdog notifications: webhook/email/Telegram when monitor offline, data gap,
-  or disk pressure.
+- ✅ **Shipped** — Prometheus metrics + status endpoint (capture state, last-data
+  age, DB lag, per-source clock offset).
+- Watchdog notifications: ✅ gap watchdog logs capture-liveness transitions;
+  webhook/email/Telegram delivery still pending.
 - De-identification pipeline for shared datasets.
 - One-command install/update; versioned releases.
 
 ### Dashboard — features
 - Multi-bed overview grid (enterprise flagship view).
-- Session browser + DB-backed replay with scrubbing and speed control.
-- Chart annotations (render the annotation API; add events from the UI).
-- Alarm history lane under the charts.
+- Session browser + DB-backed replay with scrubbing and speed control. *(Session
+  browser + load/replay shipped; scrubbing/speed pending.)*
+- ✅ **Shipped** — Chart annotations: add/list/delete event markers from the UI.
+  *(Live-chart vertical-line overlay still pending.)*
+- ❌ **Not possible** — Alarm history lane (depends on alarm capture above).
+- ✅ **Shipped** — Health status indicator + HRV view (Poincaré).
 - Saved/custom layouts; touch/tablet mode; PDF/PNG case report export.
 - Signal-quality indicators (lead-off, gap shading on the trace).
 
@@ -240,9 +251,14 @@ Agreed sequence: capture session with new modules → inspect real topics →
 refactor on `feat/dynamic-waveforms` → human-in-the-loop visual test against the
 live stack → merge.
 
-### Suggested quick wins (high value / low effort)
-1. Disconnect/gap watchdog notification (backend) — operational pain solved.
-2. EDF + Parquet export endpoint — instantly research-credible.
-3. HRV metrics + Poincaré from existing ECG stream — flagship "advanced" demo.
-4. Replay/demo mode — unlocks no-hardware demos and CI.
-5. Chart annotations — most-requested research feature in comparable tools.
+### Suggested quick wins (high value / low effort) — ✅ ALL SHIPPED 2026-06-12
+1. ✅ Disconnect/gap watchdog notification (backend) — logs capture-liveness transitions.
+2. ✅ EDF + Parquet export endpoint — instantly research-credible.
+3. ✅ HRV metrics + Poincaré from existing ECG stream — flagship "advanced" demo.
+4. ✅ Replay/demo mode — unlocks no-hardware demos and CI.
+5. ✅ Chart annotations — add/list/delete event markers from the UI.
+
+All five validated against the live MP50 on 2026-06-12 (and the released images
+deployed to the capture box). The remaining advanced-calculations backlog
+(HRV frequency-domain/LF-HF, PPG/PTT, EEG spectrogram, hemodynamics, etc.) is
+unchanged above. Alarms are the one explicitly-blocked item (see Capture & devices).
