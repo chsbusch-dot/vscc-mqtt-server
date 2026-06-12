@@ -6,8 +6,9 @@ from contextlib import asynccontextmanager
 import shutil
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from typing import Union, List, Dict, Any
+from typing import Union, List, Dict, Any, Optional
 from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import aiofiles
 import asyncpg
@@ -433,7 +434,7 @@ async def session_manager():
                     # No data this process-lifetime; close any stale open session at its last known data.
                     if open_row:
                         last = await conn.fetchval("SELECT max(time) FROM patient_numerics") or open_row["started_at"]
-                        await conn.execute("UPDATE sessions SET ended_at=$1 WHERE id=$2", last, open_row["id"])
+                        await conn.execute("UPDATE sessions SET ended_at = GREATEST($1, started_at) WHERE id=$2", last, open_row["id"])
                         print(f"[Sessions] Closed stale session #{open_row['id']}")
                     continue
                 if now - last_data_time <= gap and open_row is None:
@@ -442,7 +443,7 @@ async def session_manager():
                         f"Session {now.strftime('%Y-%m-%d %H:%M')}", last_data_time)
                     print(f"[Sessions] Opened session #{row['id']}")
                 elif now - last_data_time > gap and open_row is not None:
-                    await conn.execute("UPDATE sessions SET ended_at=$1 WHERE id=$2", last_data_time, open_row["id"])
+                    await conn.execute("UPDATE sessions SET ended_at = GREATEST($1, started_at) WHERE id=$2", last_data_time, open_row["id"])
                     print(f"[Sessions] Closed session #{open_row['id']} (data gap)")
         except Exception as e:
             print(f"[Sessions] manager error: {e}")
@@ -520,46 +521,116 @@ def _parquet_available() -> bool:
     except ImportError:
         return False
 
-@app.post("/api/sessions/{session_id}/export")
-async def export_session(session_id: int):
+EXPORT_BATCH = 50_000  # rows per cursor prefetch / parquet batch
+
+async def _export_session_files(session_id: int) -> Dict[str, Any]:
     """Write session.json + numerics/waveforms CSV (and Parquet when pyarrow is
-    present) under SESSIONS_DIR — a host bind mount, so files outlive the DB's
-    rolling retention and are plain files the user can copy or delete."""
+    present) under SESSIONS_DIR. Rows are streamed from the DB with a cursor in
+    fixed-size batches, so multi-GB sessions export with flat memory."""
+    pa = pq = None
+    if _parquet_available():
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
     async with db_pool.acquire() as conn:
         r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
         if not r:
             return {"ok": False, "error": "not found"}
         end = r["ended_at"] or datetime.now(timezone.utc)
-        numerics = await conn.fetch(
-            "SELECT time, physio_id, value FROM patient_numerics WHERE time BETWEEN $1 AND $2 ORDER BY time",
-            r["started_at"], end)
-        waveforms = await conn.fetch(
-            "SELECT time, physio_id, value FROM patient_waveforms WHERE time BETWEEN $1 AND $2 ORDER BY time",
-            r["started_at"], end)
 
-    slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in (r["label"] or "session"))[:60].strip("-") or "session"
-    out = SESSIONS_DIR / f"{r['started_at'].strftime('%Y%m%d-%H%M')}_{r['id']}_{slug}"
-    out.mkdir(parents=True, exist_ok=True)
+        slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in (r["label"] or "session"))[:60].strip("-") or "session"
+        out = SESSIONS_DIR / f"{r['started_at'].strftime('%Y%m%d-%H%M')}_{r['id']}_{slug}"
+        out.mkdir(parents=True, exist_ok=True)
+
+        files, counts = [], {}
+        for name, table in (("numerics", "patient_numerics"), ("waveforms", "patient_waveforms")):
+            count = 0
+            writer = None
+            if pq:
+                schema = pa.schema([("time_utc", pa.timestamp("us", tz="UTC")),
+                                    ("physio_id", pa.string()), ("value", pa.float64())])
+                writer = pq.ParquetWriter(out / f"{name}.parquet", schema)
+            with open(out / f"{name}.csv", "w") as f:
+                f.write("time_utc,physio_id,value\n")
+                batch = []
+                async with conn.transaction():
+                    async for x in conn.cursor(
+                            f"SELECT time, physio_id, value FROM {table} WHERE time BETWEEN $1 AND $2 ORDER BY time",
+                            r["started_at"], end, prefetch=EXPORT_BATCH):
+                        f.write(f"{x['time'].isoformat()},{x['physio_id']},{x['value']}\n")
+                        count += 1
+                        if writer:
+                            batch.append(x)
+                            if len(batch) >= EXPORT_BATCH:
+                                writer.write_table(pa.table(
+                                    {"time_utc": [b["time"] for b in batch],
+                                     "physio_id": [b["physio_id"] for b in batch],
+                                     "value": [float(b["value"]) for b in batch]}, schema=schema))
+                                batch = []
+                if writer:
+                    if batch:
+                        writer.write_table(pa.table(
+                            {"time_utc": [b["time"] for b in batch],
+                             "physio_id": [b["physio_id"] for b in batch],
+                             "value": [float(b["value"]) for b in batch]}, schema=schema))
+                    writer.close()
+                    files.append(f"{name}.parquet")
+            files.append(f"{name}.csv")
+            counts[name] = count
 
     with open(out / "session.json", "w") as f:
         json.dump({**_session_dict(r), "exported_at": datetime.now(timezone.utc).isoformat(),
-                   "numeric_rows": len(numerics), "waveform_rows": len(waveforms),
+                   "numeric_rows": counts["numerics"], "waveform_rows": counts["waveforms"],
                    "time_format": "ISO 8601 UTC"}, f, indent=2)
-    files = ["session.json"]
-    for name, rows in (("numerics", numerics), ("waveforms", waveforms)):
-        with open(out / f"{name}.csv", "w") as f:
-            f.write("time_utc,physio_id,value\n")
-            for x in rows:
-                f.write(f"{x['time'].isoformat()},{x['physio_id']},{x['value']}\n")
-        files.append(f"{name}.csv")
-    if _parquet_available():
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-        for name, rows in (("numerics", numerics), ("waveforms", waveforms)):
-            table = pa.table({"time_utc": [x["time"] for x in rows],
-                              "physio_id": [x["physio_id"] for x in rows],
-                              "value": [float(x["value"]) for x in rows]})
-            pq.write_table(table, out / f"{name}.parquet")
-            files.append(f"{name}.parquet")
+    files.insert(0, "session.json")
     return {"ok": True, "path": str(out), "files": files,
-            "numeric_rows": len(numerics), "waveform_rows": len(waveforms)}
+            "numeric_rows": counts["numerics"], "waveform_rows": counts["waveforms"]}
+
+@app.post("/api/sessions/{session_id}/export")
+async def export_session(session_id: int):
+    return await _export_session_files(session_id)
+
+@app.get("/api/sessions/{session_id}/download")
+async def download_session(session_id: int):
+    """Full data package as a zip, streamed — the browser saves it natively and
+    GB-scale packages never have to fit in memory (fresh export to disk, then a
+    chunked streaming zip of the directory)."""
+    result = await _export_session_files(session_id)
+    if not result.get("ok"):
+        return result
+    from zipstream import ZipStream  # zipstream-ng
+    import zipfile as _zf
+    out = Path(result["path"])
+    zs = ZipStream.from_path(out, compress_type=_zf.ZIP_DEFLATED, compress_level=1)
+    return StreamingResponse(iter(zs), media_type="application/zip",
+                             headers={"Content-Disposition": f'attachment; filename="{out.name}.zip"'})
+
+@app.post("/api/sessions")
+async def create_session(payload: Optional[Dict[str, Any]] = None):
+    """Manual 'New Session': closes any open session at the boundary and starts
+    recording into a fresh one (incoming data keeps flowing; only the session
+    metadata boundary moves)."""
+    now = datetime.now(timezone.utc)
+    label = (payload or {}).get("label") or f"Session {now.strftime('%Y-%m-%d %H:%M')}"
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE sessions SET ended_at = GREATEST($1, started_at) WHERE ended_at IS NULL", now)
+        r = await conn.fetchrow(
+            "INSERT INTO sessions (label, started_at) VALUES ($1, $2) RETURNING *", label, now)
+    return _session_dict(r)
+
+@app.get("/api/sessions/{session_id}/signals")
+async def session_signals(session_id: int):
+    """Distinct physio_ids in the session's range — drives the UI's metric legend."""
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
+        if not r:
+            return {"error": "not found"}
+        end = r["ended_at"] or datetime.now(timezone.utc)
+        nums = await conn.fetch(
+            "SELECT DISTINCT physio_id FROM patient_numerics WHERE time BETWEEN $1 AND $2 ORDER BY 1",
+            r["started_at"], end)
+        waves = await conn.fetch(
+            "SELECT DISTINCT physio_id FROM patient_waveforms WHERE time BETWEEN $1 AND $2 ORDER BY 1",
+            r["started_at"], end)
+    return {"numerics": [x["physio_id"] for x in nums],
+            "waveforms": [x["physio_id"] for x in waves]}
