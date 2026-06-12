@@ -248,22 +248,22 @@ APP_PATH=$(pwd)
 CLEANUP_SCRIPT_PATH="$APP_PATH/vscc-file-cleanup.py"
 UPDATE_SCRIPT_PATH="$APP_PATH/update.sh"
 
-# Job 1: File Cleanup (every hour)
+# Both jobs are written in ONE atomic crontab update (a fresh-install smoke test
+# caught the hourly job vanishing when two sequential read-modify-write cycles
+# were used), then verified.
 CLEANUP_JOB="0 * * * * /usr/bin/python3 $CLEANUP_SCRIPT_PATH"
-if ! (sudo -u "$CRON_USER" crontab -l 2>/dev/null | grep -Fq "$CLEANUP_SCRIPT_PATH"); then
-    (sudo -u "$CRON_USER" crontab -l 2>/dev/null; echo "$CLEANUP_JOB") | sudo -u "$CRON_USER" crontab -
-    echo "File cleanup cron job installed to run hourly."
-else
-    echo "File cleanup cron job already exists. Skipping."
-fi
-
-# Job 2: Auto-Update (every 3 months)
 UPDATE_JOB="0 0 1 */3 * $UPDATE_SCRIPT_PATH"
-if ! (sudo -u "$CRON_USER" crontab -l 2>/dev/null | grep -Fq "$UPDATE_SCRIPT_PATH"); then
-    (sudo -u "$CRON_USER" crontab -l 2>/dev/null; echo "$UPDATE_JOB") | sudo -u "$CRON_USER" crontab -
-    echo "Auto-update cron job installed to run quarterly."
+{
+    sudo -u "$CRON_USER" crontab -l 2>/dev/null | grep -vF "$CLEANUP_SCRIPT_PATH" | grep -vF "$UPDATE_SCRIPT_PATH"
+    echo "$CLEANUP_JOB"
+    echo "$UPDATE_JOB"
+} | sudo -u "$CRON_USER" crontab -
+
+if sudo -u "$CRON_USER" crontab -l 2>/dev/null | grep -Fq "$CLEANUP_SCRIPT_PATH" \
+   && sudo -u "$CRON_USER" crontab -l 2>/dev/null | grep -Fq "$UPDATE_SCRIPT_PATH"; then
+    echo "Cron jobs installed: hourly file cleanup + quarterly update."
 else
-    echo "Auto-update cron job already exists. Skipping."
+    echo "WARNING: cron job verification failed — check 'crontab -l' as $CRON_USER."
 fi
 
 

@@ -34,6 +34,7 @@ database, APIs, dashboard — runs from one file using prebuilt images:
 
 ```bash
 curl -O https://raw.githubusercontent.com/chsbusch-dot/vscc-mqtt-server/main/docker-compose.yml
+# (stock Ubuntu has wget instead of curl: wget https://raw.githubusercontent.com/chsbusch-dot/vscc-mqtt-server/main/docker-compose.yml)
 MONITOR_IP=192.168.1.215 docker compose up -d     # your monitor's IP
 ```
 
@@ -51,6 +52,7 @@ with confirmation.
 ```bash
 # 1. Backend: capture + broker + database (prompts for your monitor's IP)
 git clone https://github.com/chsbusch-dot/vscc-mqtt-server.git && cd vscc-mqtt-server
+# (no git yet? wget -qO- https://github.com/chsbusch-dot/vscc-mqtt-server/archive/refs/heads/main.tar.gz | tar xz && cd vscc-mqtt-server-main)
 sudo ./install.sh
 
 # 2. Dashboard, served from the same host
