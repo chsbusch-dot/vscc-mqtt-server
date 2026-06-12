@@ -42,6 +42,25 @@ Then open `http://<this-host>/` in a browser and press PLAY LIVE. The capture
 waits politely while the monitor is off and starts streaming within seconds of
 it being powered on. (LAN capture mode only; serial/MIB needs a native install.)
 
+### Two-host install (backend and dashboard on separate machines)
+
+Both machines just need Docker. You type two IPs: the monitor's (on the backend
+host) and the backend's (on the dashboard host).
+
+```bash
+# Host A — backend (note your A's IP, e.g. 192.168.1.50):
+wget https://raw.githubusercontent.com/chsbusch-dot/vscc-mqtt-server/main/docker-compose.yml
+MONITOR_IP=192.168.1.215 docker compose up -d emqx timescaledb capture worker streamer
+
+# Host B — dashboard, pointed at Host A:
+docker run -d -p 80:80 -e VSCC_HOST=192.168.1.50 --restart unless-stopped \
+  ghcr.io/chsbusch-dot/vscc-dashboard:latest
+```
+
+Open `http://<host-B>/` from any machine on the LAN. Ports 8083, 8000, and 8001
+on Host A must be reachable from viewers' browsers. Tip: give both VMs DHCP
+reservations in your router so the IPs never change.
+
 ### Alternative: systemd-native install (Linux)
 
 Runs the capture and streamer as systemd services instead of containers —

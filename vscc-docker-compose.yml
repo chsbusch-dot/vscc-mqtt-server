@@ -46,6 +46,9 @@ services:
     profiles: ["dashboard"]
     build:
       context: ../vscc-dashboard-client
+    environment:
+      # Optional: backend host the dashboard targets (default: the serving host)
+      VSCC_HOST: ${VSCC_HOST:-}
     ports:
       - "80:80"
     restart: unless-stopped

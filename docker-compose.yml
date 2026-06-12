@@ -72,6 +72,10 @@ services:
 
   dashboard:
     image: ghcr.io/chsbusch-dot/vscc-dashboard:latest
+    environment:
+      # Optional: backend host the dashboard targets (default: the serving host).
+      # Only needed when the dashboard runs on a different machine than the backend.
+      VSCC_HOST: ${VSCC_HOST:-}
     ports:
       - "80:80"
     restart: unless-stopped
