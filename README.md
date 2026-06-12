@@ -1,4 +1,9 @@
-# vscc-mqtt-server: Backend Infrastructure for Medical Telemetry
+# vscc-mqtt-server — the VSCC backend
+
+**VSCC** (*VitalSignsCapture + Charts*) is an open patient-monitor telemetry system:
+this repo is the capture/broker/database backend; **VSCC Studio**
+([vscc-dashboard-client](https://github.com/chsbusch-dot/vscc-dashboard-client)) is the
+web frontend.
 
 This is the **backend**: complete infrastructure for capturing, storing, and streaming
 data from a Philips MP50 patient monitor — Docker + `systemd`, built around
