@@ -255,7 +255,11 @@ UPDATE_SCRIPT_PATH="$APP_PATH/update.sh"
 CLEANUP_JOB="0 * * * * /usr/bin/python3 $CLEANUP_SCRIPT_PATH"
 UPDATE_JOB="0 0 1 */3 * $UPDATE_SCRIPT_PATH"
 {
-    sudo -u "$CRON_USER" crontab -l 2>/dev/null | grep -vF "$CLEANUP_SCRIPT_PATH" | grep -vF "$UPDATE_SCRIPT_PATH"
+    # '|| true': under set -e this read pipeline exits 1 on a fresh box (no
+    # crontab yet / grep selects nothing), which would kill the subshell BEFORE
+    # the echos run and install an empty crontab. Root cause of the smoke-test
+    # cron-loss bug.
+    sudo -u "$CRON_USER" crontab -l 2>/dev/null | grep -vF "$CLEANUP_SCRIPT_PATH" | grep -vF "$UPDATE_SCRIPT_PATH" || true
     echo "$CLEANUP_JOB"
     echo "$UPDATE_JOB"
 } | sudo -u "$CRON_USER" crontab -
