@@ -21,6 +21,9 @@ frontend — a React + SciChart dashboard rendering the live waveforms and vital
 
 ## Quick Start
 
+Prerequisites: a Debian/Ubuntu host with `git` and Docker (Compose V2). If either is
+missing, `install.sh` detects it and offers to install them for you (with confirmation).
+
 ```bash
 # 1. Backend: capture + broker + database (prompts for your monitor's IP)
 git clone https://github.com/chsbusch-dot/vscc-mqtt-server.git && cd vscc-mqtt-server
@@ -32,6 +35,16 @@ docker compose -f vscc-docker-compose.yml --profile dashboard up -d --build
 
 # 3. Open http://<this-host>/ in a browser and press PLAY LIVE
 ```
+
+## Supported Hardware
+
+| Status | Hardware |
+|---|---|
+| ✅ Tested | Philips IntelliVue **MP50** (LAN connection) |
+| ⚙️ Untested, but plumbed via VSCapture | Other Philips IntelliVue models (MP30–MP90, MX series), serial/MIB mode |
+| 🗺️ Roadmap | Other vendors (GE Datex S/5, GE Dash, Mindray/Draeger HL7, Spacelabs) — see [docs/ROADMAP.md](docs/ROADMAP.md) |
+
+Reports from other hardware welcome — open an issue with your model and what happened.
 
 ## System Architecture
 
@@ -287,3 +300,17 @@ This will perform a full cleanup:
 5.  **Delete Local Directories:** Removes the `VSCapture` and `.venv_viz` directories.
 
 After running, your system will be cleared of the services, data, and configurations created by the installer.
+
+## Credits & License
+
+- **[VSCapture](https://sourceforge.net/projects/vscapture/files/)** by **John George K** —
+  the open-source patient-monitor capture tool that talks to the monitor itself.
+  Licensed under the **LGPL**; it is not bundled in this repository but downloaded
+  from its official release at install time and runs as a separate process.
+- **This project** (backend stack and installer, plus the
+  [vscc-dashboard-client](https://github.com/chsbusch-dot/vscc-dashboard-client)
+  frontend) is licensed under the **MIT License** — see [LICENSE](LICENSE).
+- [SciChart.js](https://www.scichart.com/) (dashboard charting) is commercial
+  software with a free community license; see their terms for commercial use.
+- Not affiliated with, or endorsed by, Koninklijke Philips N.V. "IntelliVue" is a
+  trademark of its respective owner; it is referenced solely for interoperability.

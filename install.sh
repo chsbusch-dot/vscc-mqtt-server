@@ -98,21 +98,49 @@ if command -v apt-get &> /dev/null; then
     fi
 fi
 
-# Check for essential commands
-for cmd in docker wget unzip timeout mosquitto_sub; do
+# Check for essential commands; offer to install anything missing (Debian/Ubuntu)
+MISSING_PKGS=""
+command -v git   &> /dev/null || MISSING_PKGS="$MISSING_PKGS git"
+command -v wget  &> /dev/null || MISSING_PKGS="$MISSING_PKGS wget"
+command -v unzip &> /dev/null || MISSING_PKGS="$MISSING_PKGS unzip"
+if ! command -v docker &> /dev/null; then
+    MISSING_PKGS="$MISSING_PKGS docker.io docker-compose-v2"
+elif ! docker compose version &> /dev/null; then
+    MISSING_PKGS="$MISSING_PKGS docker-compose-v2"
+fi
+
+if [ -n "$MISSING_PKGS" ]; then
+    echo "The following required tools are missing:$MISSING_PKGS"
+    if ! command -v apt-get &> /dev/null; then
+        echo "Error: apt-get not found. Please install them manually and re-run."
+        exit 1
+    fi
+    read -p "Install them now via apt-get? [y/N] " INSTALL_DEPS
+    case "$INSTALL_DEPS" in
+        [Yy]*)
+            apt-get update && apt-get install -y $MISSING_PKGS
+            ;;
+        *)
+            echo "Aborting: install the missing tools and re-run ./install.sh."
+            exit 1
+            ;;
+    esac
+    # If Docker was just installed, make sure the daemon is enabled and running
+    if ! docker info &> /dev/null; then
+        systemctl enable --now docker 2>/dev/null || true
+    fi
+fi
+
+# Final verification after any installs
+for cmd in git docker wget unzip timeout mosquitto_sub; do
   if ! command -v $cmd &> /dev/null; then
-    echo "Error: Required command '$cmd' not found."
-    echo "On Debian/Ubuntu, you may be able to install it with:"
-    echo "sudo apt-get update && sudo apt-get install -y coreutils mosquitto-clients"
+    echo "Error: Required command '$cmd' still not found. Aborting."
     exit 1
   fi
 done
-
-# Check for Docker Compose V2 plugin
 if ! docker compose version &> /dev/null; then
-  echo "Error: 'docker compose' (V2) not found."
-  echo "Please ensure the Docker Compose V2 plugin is installed and accessible."
-  echo "It is included with modern versions of Docker Desktop."
+  echo "Error: 'docker compose' (V2) still not available. Aborting."
+  echo "On non-Ubuntu systems install the Compose plugin per https://docs.docker.com/compose/install/"
   exit 1
 fi
 
