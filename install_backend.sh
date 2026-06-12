@@ -79,11 +79,16 @@ else
     curl -fsSL -o docker-compose.yml "$COMPOSE_URL"
 fi
 
+# Compose reads MONITOR_IP from .env — survives sudo's env reset and means
+# future manual `docker compose` commands in this directory just work.
+printf 'MONITOR_IP=%s\n' "$MONITOR_IP" > .env
+say "Wrote $INSTALL_DIR/.env"
+
 SERVICES="emqx timescaledb capture worker streamer"
 case "$WITH_DASHBOARD" in [Yy]*) SERVICES="$SERVICES dashboard" ;; esac
 
 say "Starting: $SERVICES"
-MONITOR_IP="$MONITOR_IP" $DOCKER compose up -d $SERVICES
+$DOCKER compose up -d $SERVICES
 
 HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 echo
