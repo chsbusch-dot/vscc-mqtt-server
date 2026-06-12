@@ -605,6 +605,32 @@ async def download_session(session_id: int):
     return StreamingResponse(iter(zs), media_type="application/zip",
                              headers={"Content-Disposition": f'attachment; filename="{out.name}.zip"'})
 
+@app.get("/api/sessions/download-all")
+async def download_all_sessions():
+    """One zip of every session's export package. Sessions that still have rows
+    in the DB are fresh-exported first; sessions whose data already aged out of
+    retention keep their existing export folders untouched (re-exporting them
+    would clobber good files with empty ones). The whole sessions directory is
+    then streamed as a single chunked zip."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, started_at, ended_at FROM sessions ORDER BY id")
+    for r in rows:
+        end = r["ended_at"] or datetime.now(timezone.utc)
+        async with db_pool.acquire() as conn:
+            has_data = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM patient_numerics WHERE time BETWEEN $1 AND $2 LIMIT 1)"
+                " OR EXISTS (SELECT 1 FROM patient_waveforms WHERE time BETWEEN $1 AND $2 LIMIT 1)",
+                r["started_at"], end)
+        if has_data:
+            await _export_session_files(r["id"])
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    from zipstream import ZipStream  # zipstream-ng
+    import zipfile as _zf
+    zs = ZipStream.from_path(SESSIONS_DIR, compress_type=_zf.ZIP_DEFLATED, compress_level=1)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    return StreamingResponse(iter(zs), media_type="application/zip",
+                             headers={"Content-Disposition": f'attachment; filename="vscc-sessions-{stamp}.zip"'})
+
 @app.post("/api/sessions")
 async def create_session(payload: Optional[Dict[str, Any]] = None):
     """Manual 'New Session': closes any open session at the boundary and starts
