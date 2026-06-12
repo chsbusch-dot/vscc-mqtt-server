@@ -132,6 +132,52 @@ The installer automatically sets up cron jobs to keep the system running smoothl
 -   **Hourly File Cleanup:** The `VSCaptureCLI` tool generates several large data files. To prevent these from consuming excessive disk space, the `vscc-file-cleanup.py` script runs every hour, truncates any data file that grows beyond 20MB, and then restarts the VSCapture process (via the keep-alive wrapper) so it re-binds to the fresh file inodes.
 -   **Quarterly Updates:** The `update.sh` script runs every three months and pulls the images referenced in `vscc-docker-compose.yml`. Image tags are **pinned** (`emqx/emqx:6.0.0`, `timescale/timescaledb:2.19.3-pg14`), so upgrades only happen when a tag is deliberately bumped in the compose file — floating `latest` tags previously risked unattended breaking upgrades.
 
+## Testing VSCapture's Direct MQTT Export
+
+Besides the production pipeline (worker tails export files), VSCaptureCLI can publish
+numerics straight to the broker (`-export 3`). Useful as a debugging/secondary feed —
+verified working against the local EMQX. **Not** a replacement for the worker: it sends
+numerics only (no waveforms), as raw JSON batch arrays with local-time strings the
+dashboard cannot parse.
+
+The monitor accepts only one data-export association at a time, so stop the production
+capture first:
+
+```bash
+sudo systemctl stop vscc-capture-cli
+cd ~/vscc-mqtt-server/VSCapture   # or a scratch copy; export files in here are root-owned
+dotnet VSCaptureCLI.dll --devices 1 --device1type 1 --device1model 1 --device1arg "-mode 2 -port 192.168.1.215 -interval 1 -export 3 -devid mp50 -url ws://127.0.0.1:8083/mqtt -topic telemetry/mp50 -user none -passw none -waveset 0 -scale 2"
+```
+
+Watch the data arrive in a second terminal:
+
+```bash
+mosquitto_sub -h localhost -t 'telemetry/mp50/#' -v
+```
+
+Gotchas (all learned the hard way):
+
+-   VSCaptureCLI appends **`/Numeric`** to the topic — it publishes to
+    `telemetry/mp50/Numeric`, so always subscribe with the `/#` wildcard.
+-   It prints **nothing** about MQTT, ever — connection failures and successes are equally
+    silent (fire-and-forget tasks). The broker is the only source of truth.
+-   The URL needs the port **and** path: `ws://127.0.0.1:8083/mqtt`. A bare `ws://127.0.0.1`
+    silently targets port 80 and publishes nothing.
+-   EMQX's default ACL denies subscribing to the bare `#` wildcard — use a scoped filter
+    like `telemetry/mp50/#`.
+-   Messages are retained QoS 1 batch arrays; a new WebSocket connection is opened for
+    every 1-second batch. `Value` fields are strings and include `"-"` placeholders for
+    sensors without a reading.
+-   When run as a regular user inside `VSCapture/`, file writes fail with
+    `UnauthorizedAccessException` spam (the export files are root-owned, created by the
+    systemd service). Run from a scratch copy of the binaries instead.
+
+When done, restore production capture:
+
+```bash
+sudo systemctl start vscc-capture-cli
+```
+
 ## Raw Data Spot-Check
 
 `VSCaptureCLI` produces multi-GB waveform CSVs (ECG, EEG, PLETH, RESP) plus a
