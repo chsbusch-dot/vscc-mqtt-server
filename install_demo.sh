@@ -34,7 +34,7 @@ fi
 say "Starting the demo stack (no monitor needed)..."
 $DOCKER compose -f docker-compose.demo.yml up -d
 
-HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+HOST_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -vE '^(127\.|169\.254\.|172\.1[7-9]\.|172\.2[0-9]\.|172\.3[01]\.)' | head -1)
 echo
 say "Demo is up. Open http://${HOST_IP:-<this-host>}/ and press PLAY LIVE."
 say "Charts begin within a few seconds as the virtual monitor replays."
