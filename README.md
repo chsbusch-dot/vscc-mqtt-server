@@ -28,14 +28,13 @@ frontend — a React + SciChart dashboard rendering the live waveforms and vital
 
 ## Quick Start
 
-All you need is Docker (Compose V2) — on Linux, macOS (Docker Desktop), Windows
-(Docker Desktop or WSL2), or a Raspberry Pi. The entire stack — capture, broker,
-database, APIs, dashboard — runs from one file using prebuilt images:
+All you need is Docker — on Linux, macOS (Docker Desktop), Windows (Docker
+Desktop or WSL2), or a Raspberry Pi. The installer prompts for your monitor's
+IP, asks whether to serve the dashboard on the same host, and starts everything
+from prebuilt images (it offers to install Docker on Debian/Ubuntu if missing):
 
 ```bash
-curl -O https://raw.githubusercontent.com/chsbusch-dot/vscc-mqtt-server/main/docker-compose.yml
-# (stock Ubuntu has wget instead of curl: wget https://raw.githubusercontent.com/chsbusch-dot/vscc-mqtt-server/main/docker-compose.yml)
-MONITOR_IP=192.168.1.215 docker compose up -d     # your monitor's IP
+wget -qO- https://raw.githubusercontent.com/chsbusch-dot/vscc-mqtt-server/main/install_backend.sh | bash
 ```
 
 Then open `http://<this-host>/` in a browser and press PLAY LIVE. The capture
@@ -44,22 +43,37 @@ it being powered on. (LAN capture mode only; serial/MIB needs a native install.)
 
 ### Two-host install (backend and dashboard on separate machines)
 
-Both machines just need Docker. You type two IPs: the monitor's (on the backend
-host) and the backend's (on the dashboard host).
+Run the backend installer on host A (answer "n" to the dashboard question),
+then on host B:
 
 ```bash
-# Host A — backend (note your A's IP, e.g. 192.168.1.50):
-wget https://raw.githubusercontent.com/chsbusch-dot/vscc-mqtt-server/main/docker-compose.yml
-MONITOR_IP=192.168.1.215 docker compose up -d emqx timescaledb capture worker streamer
-
-# Host B — dashboard, pointed at Host A:
-docker run -d -p 80:80 -e VSCC_HOST=192.168.1.50 --restart unless-stopped \
-  ghcr.io/chsbusch-dot/vscc-dashboard:latest
+wget -qO- https://raw.githubusercontent.com/chsbusch-dot/vscc-mqtt-server/main/install_frontend.sh | bash
 ```
 
-Open `http://<host-B>/` from any machine on the LAN. Ports 8083, 8000, and 8001
-on Host A must be reachable from viewers' browsers. Tip: give both VMs DHCP
-reservations in your router so the IPs never change.
+It asks for host A's IP, checks it can reach the backend, and serves the
+dashboard at `http://<host-B>/`. Ports 8083, 8000, and 8001 on host A must be
+reachable from viewers' browsers. Tip: give both machines DHCP reservations in
+your router so the IPs never change.
+
+Non-interactive / automation: preset the answers as env vars —
+`MONITOR_IP=… WITH_DASHBOARD=yes|no` (backend), `VSCC_HOST=… PORT=…` (frontend).
+
+<details>
+<summary>What the installers run under the hood (manual alternative)</summary>
+
+```bash
+# Single host, everything:
+wget https://raw.githubusercontent.com/chsbusch-dot/vscc-mqtt-server/main/docker-compose.yml
+MONITOR_IP=192.168.1.215 docker compose up -d
+
+# Backend only (host A):
+MONITOR_IP=192.168.1.215 docker compose up -d emqx timescaledb capture worker streamer
+
+# Dashboard only (host B), pointed at host A:
+docker run -d -p 80:80 -e VSCC_HOST=<host-A-ip> --restart unless-stopped \
+  ghcr.io/chsbusch-dot/vscc-dashboard:latest
+```
+</details>
 
 ### Alternative: systemd-native install (Linux)
 
