@@ -149,6 +149,46 @@ math is fine for display-time transforms.)
 - ML hooks: export sliding windows to ONNX models (research models only, e.g.
   hypotension-prediction-style indices) with results as another derived topic.
 
+### Planned refactor — dynamic waveform registry (dashboard)
+Status: deferred until informed by real capture data; do on a feature branch
+(`feat/dynamic-waveforms`), never blind to `main`.
+
+The dashboard's state model is hardcoded to exactly five waveforms:
+
+```ts
+export type WaveformId = 'VitalSigns' | 'ECG' | 'EEG' | 'Pleth' | 'Resp';  // closed union
+globalWaveformToggles: Record<WaveformId, boolean>   // toggles keyed by those 5
+providerMappings:      Record<WaveformId, ...>       // topics keyed by those 5
+fileInputs / uploadProgress: Record<WaveformId, ...> // ditto
+```
+
+The MQTT handler routes by exact topic→WaveformId match (`Sidebar.tsx:314`) and
+drops anything unknown; SciChart series are created from a fixed `physio_id`
+list. The backend already auto-discovers new waveform exports and publishes
+them (`mp50/HF-<PhysioID>`), so a new module (e.g. BIS) flows end-to-end until
+it hits the dashboard and is silently dropped.
+
+Required changes (multi-file, core state model):
+1. Wildcard MQTT subscribe (`mp50/#` is already the default — keep).
+2. Open the closed `WaveformId` union into a dynamic registry populated from
+   incoming topics/physio_ids (with `PHYSIO_META` as the display-name catalog
+   and a sane fallback for unknown ids).
+3. Dynamic SciChart series creation/teardown per registered waveform
+   (follow `ChartContainer.tsx` lifecycle rules; fifoCapacity per sample rate).
+4. Dynamic UI toggles generated from the registry.
+
+Risk controls (why this is sequenced, not immediate):
+- SciChart rendering cannot be verified headless; a compiling-but-broken change
+  could silently kill the live dashboard. Build-gate catches compile errors only.
+- Design should be informed by REAL topic names/physio_ids (e.g. the actual BIS
+  export filename) from a capture session with the new modules attached — the
+  worker already captures, stores, and publishes every wave, so no data is lost
+  while the dashboard refactor waits.
+
+Agreed sequence: capture session with new modules → inspect real topics →
+refactor on `feat/dynamic-waveforms` → human-in-the-loop visual test against the
+live stack → merge.
+
 ### Suggested quick wins (high value / low effort)
 1. Disconnect/gap watchdog notification (backend) — operational pain solved.
 2. EDF + Parquet export endpoint — instantly research-credible.
