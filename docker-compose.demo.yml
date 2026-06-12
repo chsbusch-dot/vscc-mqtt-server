@@ -1,0 +1,84 @@
+# vscc DEMO mode — the full stack with NO patient monitor.
+#
+# A "virtual MP50" replays a de-identified recorded slice into the same export
+# files the real capture writes, so the worker, broker, database and dashboard
+# all run exactly as in a live install. Lets you try VSCC (or show it off in a
+# forum) on any machine with Docker and no hardware.
+#
+#   curl -O https://raw.githubusercontent.com/chsbusch-dot/vscc-mqtt-server/main/docker-compose.demo.yml
+#   docker compose -f docker-compose.demo.yml up -d
+#   # then open http://<this-host>/  and press PLAY LIVE
+#
+# Same images as the live stack; only `capture` is swapped for the `demo`
+# replayer, so no MONITOR_IP is needed.
+#
+# WARNING — research/education only, not a medical device. The bundled slice is
+# de-identified sample data.
+
+name: vscc-demo
+
+services:
+  emqx:
+    image: emqx/emqx:6.0.0
+    ports:
+      - "1883:1883"
+      - "8083:8083"
+      - "18083:18083"
+    restart: unless-stopped
+
+  timescaledb:
+    image: timescale/timescaledb:2.19.3-pg14
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: telemetry
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  demo:
+    image: ghcr.io/chsbusch-dot/vscc-worker:latest
+    command: ["python", "vscc-demo-replayer.py"]
+    environment:
+      TZ: UTC            # replayer stamps in this TZ; worker MONITOR_TZ must match
+      VSC_DATA_DIR: /data
+    volumes:
+      - vscc-data:/data
+    restart: unless-stopped
+
+  worker:
+    image: ghcr.io/chsbusch-dot/vscc-worker:latest
+    depends_on:
+      - timescaledb
+      - emqx
+    environment:
+      DB_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-password}@timescaledb:5432/telemetry
+      MQTT_BROKER: emqx
+      MONITOR_TZ: UTC    # must match the demo replayer's TZ
+      VSC_DATA_DIR: /data
+    volumes:
+      - vscc-data:/data
+      - ./sessions:/sessions
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+
+  streamer:
+    image: ghcr.io/chsbusch-dot/vscc-streamer:latest
+    volumes:
+      - vscc-data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  dashboard:
+    image: ghcr.io/chsbusch-dot/vscc-dashboard:latest
+    environment:
+      VSCC_HOST: ${VSCC_HOST:-}
+    ports:
+      - "80:80"
+    restart: unless-stopped
+
+volumes:
+  vscc-data:
+  timescaledb-data:

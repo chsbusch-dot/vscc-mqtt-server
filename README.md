@@ -46,6 +46,21 @@ Then open `http://<this-host>/` in a browser and press PLAY LIVE. The capture
 waits politely while the monitor is off and starts streaming within seconds of
 it being powered on. (LAN capture mode only; serial/MIB needs a native install.)
 
+### Try it without hardware (demo mode)
+
+No monitor? A **virtual MP50** replays a de-identified recorded slice through
+the real pipeline, so you get live waveforms (ECG, EEG, Pleth, Resp) and
+numerics with nothing plugged in — handy for a first look or a forum demo:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/chsbusch-dot/vscc-mqtt-server/main/install_demo.sh | bash
+# or: curl -O https://raw.githubusercontent.com/chsbusch-dot/vscc-mqtt-server/main/docker-compose.demo.yml
+#     docker compose -f docker-compose.demo.yml up -d
+```
+
+Open `http://<this-host>/`, press PLAY LIVE, and charts begin within seconds.
+No `MONITOR_IP` needed; `capture` is swapped for the replayer.
+
 ### Two-host install (backend and dashboard on separate machines)
 
 Run the backend installer on host A (answer "n" to the dashboard question),
