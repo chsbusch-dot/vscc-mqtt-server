@@ -1,11 +1,34 @@
 # vscc-mqtt-server: Backend Infrastructure for Medical Telemetry
 
-This directory contains the complete backend infrastructure for capturing, storing, and streaming data from a Philips MP50 patient monitor. It uses Docker and `systemd` to create a robust, manageable system. The matching real-time charting client lives in the [vscc-dashboard-client](https://github.com/chsbusch-dot/vscc-dashboard-client) repo (React + SciChart; connects via MQTT-over-WebSocket on port 8083 or the streamer on port 8000).
+This is the **backend**: complete infrastructure for capturing, storing, and streaming
+data from a Philips MP50 patient monitor — Docker + `systemd`, built around
+[VSCapture](https://sourceforge.net/projects/vscapture/files/), the open-source
+patient-monitor capture tool by John George K (the installer downloads the latest
+VSCapture automatically). It pairs with the
+[vscc-dashboard-client](https://github.com/chsbusch-dot/vscc-dashboard-client)
+frontend — a React + SciChart dashboard rendering the live waveforms and vitals at
+60 FPS, connecting via MQTT-over-WebSocket (port 8083) or the streamer (port 8000).
 
 > **Research and education use only — not a medical device.** This software is not
 > cleared or approved for clinical use and must never be used for patient
 > monitoring, alarming, or any clinical decision-making. A certified monitor
 > remains the source of truth at all times.
+
+[![MP50 Vital Sign Dashboard](https://raw.githubusercontent.com/chsbusch-dot/vscc-dashboard-client/main/docs/screenshots/dashboard-full.png)](https://github.com/chsbusch-dot/vscc-dashboard-client)
+
+## Quick Start
+
+```bash
+# 1. Backend: capture + broker + database (prompts for your monitor's IP)
+git clone https://github.com/chsbusch-dot/vscc-mqtt-server.git && cd vscc-mqtt-server
+sudo ./install.sh
+
+# 2. Dashboard, served from the same host
+git clone https://github.com/chsbusch-dot/vscc-dashboard-client.git ../vscc-dashboard-client
+docker compose -f vscc-docker-compose.yml --profile dashboard up -d --build
+
+# 3. Open http://<this-host>/ in a browser and press PLAY LIVE
+```
 
 ## System Architecture
 
