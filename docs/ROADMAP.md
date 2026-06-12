@@ -61,6 +61,36 @@ Clean-room from the published Philips IntelliVue Data Export Protocol guide —
   HL7 vendors (Mindray, Draeger HL7 — testable from spec + HL7 simulators, no
   hardware required) → others on request.
 
+### Phase 2.5 — Packaging milestone: one `docker compose up` (also unlocks macOS/Windows)
+Goal: the entire product installs with one file and one command on any OS with
+Docker — no git clones, no install.sh, no systemd.
+
+1. **Containerize capture + streamer.** Capture container = .NET runtime +
+   VSCaptureCLI + keep-alive loop (monitor IP via env var); capture and worker
+   share a **named volume** for export files (cleaner than the host directory:
+   no root-owned-file traps, no Docker Desktop file-sharing slowness). The
+   file-cleanup cron becomes a loop in the capture container. (~2 days)
+2. **Publish prebuilt images to GHCR** via GitHub Actions on both repos:
+   `ghcr.io/chsbusch-dot/vscc-{capture,worker,streamer,dashboard}`. Tag with
+   releases; multi-arch (amd64 + arm64 → Raspberry Pi support for ~free).
+3. **Single top-level `docker-compose.yml`** referencing the published images.
+   Install story becomes: `curl -O .../docker-compose.yml && MONITOR_IP=... docker compose up -d`.
+4. **WSL2 docs page** for Windows (near-zero work: enable systemd in wsl.conf,
+   follow Linux instructions — or just use the compose path).
+5. `install.sh` remains as the systemd-native Linux option.
+
+Explicitly rejected: fat single-container (or one-per-repo) builds via
+supervisord/s6 — they trade away the official EMQX/TimescaleDB image update
+path, tangle restart lifecycles (capture restarts by design whenever the
+monitor power-cycles; it must not share a container with the database), and
+buy nothing the compose file doesn't already deliver. The only future
+single-artifact play is an appliance image (Pi SD card / OVA) that wraps the
+compose stack.
+
+Native macOS/Windows services (launchd/NSSM): not planned. Only serial/MIB
+capture would ever require them (Docker Desktop cannot pass serial ports);
+defer until someone actually asks.
+
 ### Phase 5 — Monetization (open-core)
 - **Community (free, OSS):** single monitor, capture → MQTT → TimescaleDB →
   dashboard, demo mode.
