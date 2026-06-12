@@ -9,10 +9,17 @@ VSCapture automatically). It pairs with the
 frontend — a React + SciChart dashboard rendering the live waveforms and vitals at
 60 FPS, connecting via MQTT-over-WebSocket (port 8083) or the streamer (port 8000).
 
-> **Research and education use only — not a medical device.** This software is not
-> cleared or approved for clinical use and must never be used for patient
-> monitoring, alarming, or any clinical decision-making. A certified monitor
-> remains the source of truth at all times.
+> [!WARNING]
+> **Research and education use only — not a medical device.**
+> This software is not cleared or approved for clinical use and must never be used
+> for patient monitoring, alarming, or any clinical decision-making. A certified
+> monitor remains the source of truth at all times.
+>
+> **Patient data stays local.** Captured telemetry may constitute Protected Health
+> Information (PHI). Never publish it to brokers, dashboards, or endpoints outside
+> your controlled network, and never write physiological values into logs, browser
+> consoles, or third-party telemetry/analytics services. De-identify any recording
+> before sharing it.
 
 [![MP50 Vital Sign Dashboard](https://raw.githubusercontent.com/chsbusch-dot/vscc-dashboard-client/main/docs/screenshots/dashboard-full.png)](https://github.com/chsbusch-dot/vscc-dashboard-client)
 
