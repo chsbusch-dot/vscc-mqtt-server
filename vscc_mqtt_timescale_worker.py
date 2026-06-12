@@ -3,7 +3,8 @@ import json
 import os
 from pathlib import Path
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+import shutil
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Union, List, Dict, Any
 from fastapi import FastAPI
@@ -74,6 +75,15 @@ def wave_config(path: Path) -> Dict[str, Any]:
 numerics_buffer = []
 waveforms_buffer = []
 db_pool = None
+# Newest data timestamp inserted this process-lifetime (data-time axis, UTC).
+# Drives the auto-session manager.
+last_data_time = None
+
+SESSIONS_DIR = Path(os.getenv("SESSIONS_DIR", "/sessions"))
+DEFAULT_SETTINGS = {
+    "retention_hours": "12",
+    "session_gap_minutes": "3",  # data silence that closes a session
+}
 
 # --- Utility Functions ---
 
@@ -107,6 +117,10 @@ async def batch_inserter():
                     await connection.executemany("INSERT INTO patient_numerics (time, physio_id, value) VALUES ($1, $2, $3)", numerics_to_insert)
                 if waveforms_to_insert:
                     await connection.executemany("INSERT INTO patient_waveforms (time, physio_id, value) VALUES ($1, $2, $3)", waveforms_to_insert)
+            global last_data_time
+            newest = max((row[0] for row in numerics_to_insert + waveforms_to_insert), default=None)
+            if newest and (last_data_time is None or newest > last_data_time):
+                last_data_time = newest
         except Exception as e:
             print(f"Database batch insert error: {e}")
 
@@ -256,6 +270,19 @@ SCHEMA_STATEMENTS = [
         if_not_exists => TRUE)""",
     "SELECT add_retention_policy('patient_numerics', INTERVAL '12 hours', if_not_exists => TRUE)",
     "SELECT add_retention_policy('patient_waveforms', INTERVAL '12 hours', if_not_exists => TRUE)",
+    # Sessions: time-range metadata over the data axis (no per-row tagging).
+    """CREATE TABLE IF NOT EXISTS sessions (
+        id SERIAL PRIMARY KEY,
+        label TEXT NOT NULL DEFAULT '',
+        subject_code TEXT NOT NULL DEFAULT '',
+        notes TEXT NOT NULL DEFAULT '',
+        started_at TIMESTAMPTZ NOT NULL,
+        ended_at TIMESTAMPTZ
+    )""",
+    """CREATE TABLE IF NOT EXISTS vscc_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )""",
 ]
 
 async def ensure_schema(pool):
@@ -279,6 +306,11 @@ async def lifespan(app: FastAPI):
             print(f"Database connection failed: {e}. Retrying in 5s...")
             await asyncio.sleep(5)
     await ensure_schema(db_pool)
+    # Apply persisted settings (e.g. user-configured retention) on every boot.
+    try:
+        await apply_retention(int((await get_settings())["retention_hours"]))
+    except Exception as e:
+        print(f"Could not apply persisted retention setting: {e}")
     
     tasks = []
     app_started = False
@@ -288,6 +320,7 @@ async def lifespan(app: FastAPI):
                 async with aiomqtt.Client(MQTT_BROKER, port=MQTT_PORT) as client:
                     print(f"Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
                     tasks.append(asyncio.create_task(batch_inserter()))
+                    tasks.append(asyncio.create_task(session_manager()))
                     # Numerics: one fixed JSON tailer (carries every parameter PhysioID).
                     tasks.append(asyncio.create_task(tail_file(NUMERICS_CONFIG, client)))
                     # Waveforms: discovered dynamically so new modules stream with no code change.
@@ -337,3 +370,196 @@ async def get_historic_data(range_minutes: int):
         history[pid].append({"time": r['time'].timestamp(), "value": r['value']})
 
     return history
+
+# --- 4. Settings ---
+
+async def get_settings() -> Dict[str, str]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT key, value FROM vscc_settings")
+    settings = dict(DEFAULT_SETTINGS)
+    settings.update({r["key"]: r["value"] for r in rows})
+    return settings
+
+async def apply_retention(hours: int):
+    """Live-update the retention policies (whole-chunk drops, applied by Timescale's scheduler)."""
+    async with db_pool.acquire() as conn:
+        for table in ("patient_numerics", "patient_waveforms"):
+            await conn.execute(f"SELECT remove_retention_policy('{table}', if_exists => TRUE)")
+            await conn.execute(f"SELECT add_retention_policy('{table}', INTERVAL '{int(hours)} hours', if_not_exists => TRUE)")
+
+@app.get("/api/settings")
+async def read_settings():
+    settings = await get_settings()
+    async with db_pool.acquire() as conn:
+        db_bytes = await conn.fetchval("SELECT pg_database_size('telemetry')")
+    disk = {}
+    try:
+        usage = shutil.disk_usage(SESSIONS_DIR if SESSIONS_DIR.exists() else "/")
+        disk = {"total_bytes": usage.total, "free_bytes": usage.free}
+    except Exception:
+        pass
+    return {**settings, "db_size_bytes": db_bytes, "disk": disk,
+            "sessions_dir": str(SESSIONS_DIR), "parquet_available": _parquet_available()}
+
+@app.put("/api/settings")
+async def write_settings(payload: Dict[str, Any]):
+    allowed = {k: str(v) for k, v in payload.items() if k in DEFAULT_SETTINGS}
+    async with db_pool.acquire() as conn:
+        for k, v in allowed.items():
+            await conn.execute(
+                "INSERT INTO vscc_settings (key, value) VALUES ($1, $2) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", k, v)
+    if "retention_hours" in allowed:
+        try:
+            await apply_retention(int(allowed["retention_hours"]))
+        except Exception as e:
+            return {"ok": False, "error": f"settings saved but retention not applied: {e}"}
+    return {"ok": True, **allowed}
+
+# --- 5. Sessions: auto-managed recording ranges over the data-time axis ---
+
+async def session_manager():
+    """Opens a session when data starts flowing, closes it after a configurable
+    silence (monitor off / case over). Runs forever; survives DB hiccups."""
+    while True:
+        await asyncio.sleep(10)
+        try:
+            settings = await get_settings()
+            gap = timedelta(minutes=float(settings["session_gap_minutes"]))
+            now = datetime.now(timezone.utc)
+            async with db_pool.acquire() as conn:
+                open_row = await conn.fetchrow("SELECT id, started_at FROM sessions WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1")
+                if last_data_time is None:
+                    # No data this process-lifetime; close any stale open session at its last known data.
+                    if open_row:
+                        last = await conn.fetchval("SELECT max(time) FROM patient_numerics") or open_row["started_at"]
+                        await conn.execute("UPDATE sessions SET ended_at=$1 WHERE id=$2", last, open_row["id"])
+                        print(f"[Sessions] Closed stale session #{open_row['id']}")
+                    continue
+                if now - last_data_time <= gap and open_row is None:
+                    row = await conn.fetchrow(
+                        "INSERT INTO sessions (label, started_at) VALUES ($1, $2) RETURNING id",
+                        f"Session {now.strftime('%Y-%m-%d %H:%M')}", last_data_time)
+                    print(f"[Sessions] Opened session #{row['id']}")
+                elif now - last_data_time > gap and open_row is not None:
+                    await conn.execute("UPDATE sessions SET ended_at=$1 WHERE id=$2", last_data_time, open_row["id"])
+                    print(f"[Sessions] Closed session #{open_row['id']} (data gap)")
+        except Exception as e:
+            print(f"[Sessions] manager error: {e}")
+
+def _session_dict(r) -> Dict[str, Any]:
+    return {"id": r["id"], "label": r["label"], "subject_code": r["subject_code"],
+            "notes": r["notes"], "started_at": r["started_at"].timestamp(),
+            "ended_at": r["ended_at"].timestamp() if r["ended_at"] else None,
+            "recording": r["ended_at"] is None}
+
+@app.get("/api/sessions")
+async def list_sessions():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM sessions ORDER BY started_at DESC LIMIT 200")
+    return [_session_dict(r) for r in rows]
+
+@app.patch("/api/sessions/{session_id}")
+async def update_session(session_id: int, payload: Dict[str, Any]):
+    fields = {k: str(payload[k]) for k in ("label", "subject_code", "notes") if k in payload}
+    if not fields:
+        return {"ok": False, "error": "nothing to update"}
+    sets = ", ".join(f"{k} = ${i+2}" for i, k in enumerate(fields))
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow(f"UPDATE sessions SET {sets} WHERE id = $1 RETURNING *",
+                                session_id, *fields.values())
+    return _session_dict(r) if r else {"ok": False, "error": "not found"}
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: int, purge_data: bool = True):
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
+        if not r:
+            return {"ok": False, "error": "not found"}
+        if r["ended_at"] is None:
+            return {"ok": False, "error": "session is recording — cannot delete a live session"}
+        deleted_rows = 0
+        if purge_data:
+            for table in ("patient_numerics", "patient_waveforms"):
+                res = await conn.execute(f"DELETE FROM {table} WHERE time >= $1 AND time <= $2",
+                                         r["started_at"], r["ended_at"])
+                deleted_rows += int(res.split()[-1])
+        await conn.execute("DELETE FROM sessions WHERE id = $1", session_id)
+    return {"ok": True, "deleted_data_rows": deleted_rows}
+
+@app.get("/api/sessions/{session_id}/data")
+async def session_data(session_id: int, max_raw_minutes: int = 15):
+    """Session data for chart replay. Waveforms come back raw for short sessions,
+    1-minute aggregated (avg) beyond max_raw_minutes to keep payloads sane."""
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
+        if not r:
+            return {"error": "not found"}
+        end = r["ended_at"] or datetime.now(timezone.utc)
+        span_min = (end - r["started_at"]).total_seconds() / 60
+        numerics = await conn.fetch(
+            "SELECT time, physio_id, value FROM patient_numerics WHERE time BETWEEN $1 AND $2 ORDER BY time",
+            r["started_at"], end)
+        aggregated = span_min > max_raw_minutes
+        if aggregated:
+            waveforms = await conn.fetch(
+                "SELECT bucket AS time, physio_id, avg_value AS value FROM patient_waveforms_1min "
+                "WHERE bucket BETWEEN $1 AND $2 ORDER BY bucket", r["started_at"], end)
+        else:
+            waveforms = await conn.fetch(
+                "SELECT time, physio_id, value FROM patient_waveforms WHERE time BETWEEN $1 AND $2 ORDER BY time",
+                r["started_at"], end)
+    fmt = lambda rows: [{"time": x["time"].timestamp(), "physio_id": x["physio_id"], "value": float(x["value"])} for x in rows]
+    return {"session": _session_dict(r), "aggregated_waveforms": aggregated,
+            "numerics": fmt(numerics), "waveforms": fmt(waveforms)}
+
+def _parquet_available() -> bool:
+    try:
+        import pyarrow  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+@app.post("/api/sessions/{session_id}/export")
+async def export_session(session_id: int):
+    """Write session.json + numerics/waveforms CSV (and Parquet when pyarrow is
+    present) under SESSIONS_DIR — a host bind mount, so files outlive the DB's
+    rolling retention and are plain files the user can copy or delete."""
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
+        if not r:
+            return {"ok": False, "error": "not found"}
+        end = r["ended_at"] or datetime.now(timezone.utc)
+        numerics = await conn.fetch(
+            "SELECT time, physio_id, value FROM patient_numerics WHERE time BETWEEN $1 AND $2 ORDER BY time",
+            r["started_at"], end)
+        waveforms = await conn.fetch(
+            "SELECT time, physio_id, value FROM patient_waveforms WHERE time BETWEEN $1 AND $2 ORDER BY time",
+            r["started_at"], end)
+
+    slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in (r["label"] or "session"))[:60].strip("-") or "session"
+    out = SESSIONS_DIR / f"{r['started_at'].strftime('%Y%m%d-%H%M')}_{r['id']}_{slug}"
+    out.mkdir(parents=True, exist_ok=True)
+
+    with open(out / "session.json", "w") as f:
+        json.dump({**_session_dict(r), "exported_at": datetime.now(timezone.utc).isoformat(),
+                   "numeric_rows": len(numerics), "waveform_rows": len(waveforms),
+                   "time_format": "ISO 8601 UTC"}, f, indent=2)
+    files = ["session.json"]
+    for name, rows in (("numerics", numerics), ("waveforms", waveforms)):
+        with open(out / f"{name}.csv", "w") as f:
+            f.write("time_utc,physio_id,value\n")
+            for x in rows:
+                f.write(f"{x['time'].isoformat()},{x['physio_id']},{x['value']}\n")
+        files.append(f"{name}.csv")
+    if _parquet_available():
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        for name, rows in (("numerics", numerics), ("waveforms", waveforms)):
+            table = pa.table({"time_utc": [x["time"] for x in rows],
+                              "physio_id": [x["physio_id"] for x in rows],
+                              "value": [float(x["value"]) for x in rows]})
+            pq.write_table(table, out / f"{name}.parquet")
+            files.append(f"{name}.parquet")
+    return {"ok": True, "path": str(out), "files": files,
+            "numeric_rows": len(numerics), "waveform_rows": len(waveforms)}

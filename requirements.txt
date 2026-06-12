@@ -5,3 +5,4 @@ asyncpg
 aiomqtt
 uvicorn
 tzdata
+pyarrow

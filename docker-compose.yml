@@ -63,6 +63,9 @@ services:
       VSC_DATA_DIR: /data
     volumes:
       - vscc-data:/data
+      # Session exports land OUTSIDE Docker as plain host files (./sessions next
+      # to this compose file) — easy to copy, back up, or delete.
+      - ./sessions:/sessions
     ports:
       - "8001:8000"    # historic data API
     restart: unless-stopped
