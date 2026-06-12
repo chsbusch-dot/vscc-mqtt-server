@@ -93,7 +93,7 @@ Philips MP50 ──UDP──► VSCaptureCLI ──► export files (JSON numeri
 
 1.  **VSCapture CLI (`systemd` service `vscc-capture-cli`):** A .NET application that connects to the patient monitor and writes raw telemetry to export files in `VSCapture/`. It runs under a keep-alive wrapper (repo file `vscc-capture-loop.sh`, installed by `install.sh` as `VSCapture/vscc-loop.sh`) that pings the monitor before launching and restarts the capture automatically when the monitor goes offline or the UDP connection times out — the service never enters a failed state while waiting for the monitor. The wrapper also handles the MP50's single-association limit: a silent-hang watchdog recycles a capture that runs without producing data (stale association), and abrupt stops are time-stamped so the next start waits out the monitor's ~90 s association timeout. Net effect: `systemctl restart vscc-capture-cli` is always safe; expect up to ~90 s before data resumes.
 2.  **Python Worker (`docker` container):** Tails the vitals JSON plus every waveform CSV it discovers (`NOM_*WaveExport.csv` — a newly connected monitor module streams automatically, no code change), publishes each sample to a per-signal MQTT topic, batch-inserts everything into TimescaleDB, and serves historic data over FastAPI on port **8001**.
-3.  **EMQX (`docker` container):** The MQTT broker. Raw TCP on **1883**, MQTT-over-WebSocket on **8083** (path `/mqtt`) for browser clients, admin dashboard on **18083**.
+3.  **EMQX (`docker` container):** The MQTT broker. Raw TCP on **1883**, MQTT-over-WebSocket on **8083** (path `/mqtt`) for browser clients, admin dashboard on **18083** (default login `admin` / `public` — EMQX forces a password change on first login; do it).
 4.  **TimescaleDB (`docker` container):** PostgreSQL + TimescaleDB on **5432** (db `telemetry`, hypertables `patient_numerics` / `patient_waveforms`, 12 h retention).
 5.  **WebSocket Streamer (`systemd` service `vscc-websocket-streamer`):** Serves the raw numerics JSON over HTTP and a normalized live stream over WebSocket, both on port **8000**.
 
@@ -200,7 +200,7 @@ docker exec vscc-mqtt-server-timescaledb-1 psql -U postgres -d telemetry -Atc \
 curl http://localhost:8001/api/historic/5
 ```
 
-Logs: `journalctl -u vscc-capture-cli -f`, `journalctl -u vscc-websocket-streamer -f`, `docker logs -f vscc-mqtt-server-worker-1`. Note: the worker container buffers stdout, so sparse logs don't mean it is stuck — trust the DB freshness query. EMQX admin UI: `http://<host>:18083`.
+Logs: `journalctl -u vscc-capture-cli -f`, `journalctl -u vscc-websocket-streamer -f`, `docker logs -f vscc-mqtt-server-worker-1`. Note: the worker container buffers stdout, so sparse logs don't mean it is stuck — trust the DB freshness query. EMQX admin UI: `http://<host>:18083` (first login: `admin` / `public`, then it prompts you to set a real password).
 
 ## Automated Maintenance
 
