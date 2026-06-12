@@ -2,6 +2,10 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
+# Stream print()/logging straight to docker logs (no stdout buffering),
+# so file-discovery, tailing, and disconnect messages are visible live.
+ENV PYTHONUNBUFFERED=1
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
