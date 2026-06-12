@@ -48,7 +48,8 @@ if [ "$1" == "-u" ]; then
     if [ -f "$COMPOSE_FILE" ]; then
         echo "Stopping and removing Docker containers, networks, and all related images/volumes..."
         # The 'down' command with -v removes volumes and --rmi 'all' removes images
-        docker compose -f "$COMPOSE_FILE" down -v --rmi all
+        # --profile dashboard so the optional dashboard container is removed too
+        docker compose -f "$COMPOSE_FILE" --profile dashboard down -v --rmi all
     else
         echo "Docker compose file not found, skipping Docker cleanup."
     fi
