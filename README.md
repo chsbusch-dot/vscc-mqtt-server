@@ -164,6 +164,7 @@ browser; the same API is available to scripts:
 | `DELETE /api/sessions/{id}` | Delete a closed session (+ its data rows) |
 | `GET /api/sessions/{id}/data` | Replay payload for the dashboard charts |
 | `GET /api/sessions/{id}/signals` | Distinct numeric/waveform signals in range |
+| `POST` / `GET` / `DELETE /api/annotations` | Timestamped event markers (e.g. "intubation"), optionally tied to a session |
 | `GET /api/sessions/{id}/quality` | **Loss statistics**: per-waveform nominal rate, expected vs actual samples, gap count, longest gap |
 | `POST /api/sessions/{id}/export` | Write the export package to `./sessions/` on the host |
 | `GET /api/sessions/{id}/download` | The export package as one streamed zip |
