@@ -16,3 +16,6 @@ __pycache__/
 # macOS
 .DS_Store
 **/.DS_Store
+
+# Runtime session exports (bind-mounted output, may be many GB)
+sessions/
