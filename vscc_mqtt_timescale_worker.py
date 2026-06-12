@@ -340,6 +340,15 @@ SCHEMA_STATEMENTS = [
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     )""",
+    # Annotations: timestamped event markers (e.g. "intubation", "drug given")
+    # on the data-time axis, optionally tied to a session.
+    """CREATE TABLE IF NOT EXISTS annotations (
+        id SERIAL PRIMARY KEY,
+        time TIMESTAMPTZ NOT NULL,
+        label TEXT NOT NULL DEFAULT '',
+        session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE
+    )""",
+    "CREATE INDEX IF NOT EXISTS annotations_time_idx ON annotations (time)",
 ]
 
 async def ensure_schema(pool):
@@ -1186,3 +1195,48 @@ async def session_hrv(session_id: int, physio_id: Optional[str] = None):
     result = vscc_hrv.analyze_ecg(np.asarray(times), np.asarray(values))
     return {"session": _session_dict(r), "physio_id": physio_id,
             "samples": len(values), "truncated": truncated, **result}
+
+# --- 9. Annotations: timestamped event markers ---
+
+def _annotation_dict(r) -> Dict[str, Any]:
+    return {"id": r["id"], "time": r["time"].timestamp(), "label": r["label"],
+            "session_id": r["session_id"]}
+
+@app.post("/api/annotations")
+async def create_annotation(payload: Dict[str, Any]):
+    """Add an event marker. `time` is epoch seconds (default: now). Optionally
+    tie it to a session_id (deleted with the session)."""
+    label = str(payload.get("label", "")).strip()
+    if not label:
+        return {"ok": False, "error": "label is required"}
+    ts = payload.get("time")
+    when = datetime.fromtimestamp(float(ts), timezone.utc) if ts is not None else datetime.now(timezone.utc)
+    session_id = payload.get("session_id")
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow(
+            "INSERT INTO annotations (time, label, session_id) VALUES ($1, $2, $3) RETURNING *",
+            when, label[:500], int(session_id) if session_id is not None else None)
+    return _annotation_dict(r)
+
+@app.get("/api/annotations")
+async def list_annotations(session_id: Optional[int] = None,
+                           from_ts: Optional[float] = None, to_ts: Optional[float] = None):
+    """List event markers, newest first. Filter by session_id or a time window
+    (from_ts/to_ts, epoch seconds)."""
+    clauses, args = [], []
+    if session_id is not None:
+        args.append(session_id); clauses.append(f"session_id = ${len(args)}")
+    if from_ts is not None:
+        args.append(datetime.fromtimestamp(from_ts, timezone.utc)); clauses.append(f"time >= ${len(args)}")
+    if to_ts is not None:
+        args.append(datetime.fromtimestamp(to_ts, timezone.utc)); clauses.append(f"time <= ${len(args)}")
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(f"SELECT * FROM annotations{where} ORDER BY time DESC LIMIT 500", *args)
+    return [_annotation_dict(r) for r in rows]
+
+@app.delete("/api/annotations/{annotation_id}")
+async def delete_annotation(annotation_id: int):
+    async with db_pool.acquire() as conn:
+        res = await conn.execute("DELETE FROM annotations WHERE id = $1", annotation_id)
+    return {"ok": res.split()[-1] != "0"}
