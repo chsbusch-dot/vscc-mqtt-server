@@ -200,7 +200,10 @@ async def tail_file(config: Dict[str, Any], client: aiomqtt.Client):
                 await f.seek(0, os.SEEK_END)
                 last_size = os.path.getsize(file_path)
                 last_ino = os.stat(file_path).st_ino
-                last_data_time = loop.time()
+                # NOTE: monotonic clock, function-LOCAL — deliberately NOT the
+                # module-global `last_data_time` (UTC datetime, which drives
+                # sessions/capture-state). Distinct name so the two never cross.
+                last_read_monotonic = loop.time()
 
                 while True:
                     line = await f.readline()
@@ -210,7 +213,7 @@ async def tail_file(config: Dict[str, Any], client: aiomqtt.Client):
                         current_time = loop.time()
                         
                         # 1. Check for Disconnects (Lead Off)
-                        if current_time - last_data_time > WAVEFORM_DISCONNECT_TIMEOUT:
+                        if current_time - last_read_monotonic > WAVEFORM_DISCONNECT_TIMEOUT:
                             if file_type == "csv" and not disconnected_sent:
                                 print(f"Timeout on {file_path.name}. Sending disconnect signal to {topic}.")
                                 null_payload = json.dumps({"value": None, "physio_id": config["physio_id"], "time": datetime.now(timezone.utc).timestamp()})
@@ -233,7 +236,7 @@ async def tail_file(config: Dict[str, Any], client: aiomqtt.Client):
                         continue
 
                     # We successfully read a line
-                    last_data_time = loop.time()
+                    last_read_monotonic = loop.time()
                     disconnected_sent = False
                     line = line.strip()
                     if not line:
@@ -352,13 +355,19 @@ SCHEMA_STATEMENTS = [
 ]
 
 async def ensure_schema(pool):
+    failures = 0
     async with pool.acquire() as connection:
         for stmt in SCHEMA_STATEMENTS:
             try:
                 await connection.execute(stmt)
             except Exception as e:
+                failures += 1
                 print(f"Schema bootstrap statement failed (continuing): {e}")
-    print("Database schema verified.")
+    if failures:
+        print(f"Database schema bootstrap finished with {failures}/{len(SCHEMA_STATEMENTS)} "
+              f"statement(s) failing — see errors above.")
+    else:
+        print("Database schema verified.")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -417,7 +426,10 @@ async def lifespan(app: FastAPI):
         if db_pool: await db_pool.close()
 
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+# allow_credentials stays False: the API uses no cookies/auth, and "*" origins
+# with credentials is both an invalid combination and a needless exposure for a
+# service the README flags as PHI-bearing.
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/api/historic/{range_minutes}")
 async def get_historic_data(range_minutes: int):

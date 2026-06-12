@@ -56,15 +56,18 @@ done
 # --- Reachability hint (non-fatal) ---
 probe() {
     if command -v wget >/dev/null 2>&1; then
-        wget -qO- --timeout=4 "http://$VSCC_HOST:8001/api/historic/1" >/dev/null 2>&1
+        wget -qO- --timeout=4 "http://$VSCC_HOST:8001/api/status" >/dev/null 2>&1
     elif command -v curl >/dev/null 2>&1; then
-        curl -fsS --max-time 4 "http://$VSCC_HOST:8001/api/historic/1" >/dev/null 2>&1
+        curl -fsS --max-time 4 "http://$VSCC_HOST:8001/api/status" >/dev/null 2>&1
     else
-        return 0
+        return 2   # no probe tool available — UNKNOWN, not "reachable"
     fi
 }
-if probe; then
+probe; probe_rc=$?
+if [ "$probe_rc" -eq 0 ]; then
     say "Backend reachable at $VSCC_HOST — good."
+elif [ "$probe_rc" -eq 2 ]; then
+    say "Skipping backend reachability check (no wget/curl available)."
 else
     say "WARNING: could not reach the backend API at http://$VSCC_HOST:8001 —"
     say "continuing anyway, but check the backend is up and the IP is right."
@@ -76,7 +79,9 @@ say "Starting dashboard (image: $IMAGE)..."
 $DOCKER run -d --name vscc-dashboard -p "$PORT:80" -e VSCC_HOST="$VSCC_HOST" \
     --restart unless-stopped "$IMAGE" >/dev/null
 
-HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+# Prefer a real LAN IP: drop loopback, link-local, and Docker bridge ranges
+# (172.17–172.31) so we don't advertise the docker0 address to users.
+HOST_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -vE '^(127\.|169\.254\.|172\.1[7-9]\.|172\.2[0-9]\.|172\.3[01]\.)' | head -1)
 echo
 say "Dashboard is up: http://${HOST_IP:-<this-host>}$( [ "$PORT" = "80" ] || echo ":$PORT" )/"
 say "It streams from the backend at $VSCC_HOST (MQTT :8083, streamer :8000, API :8001)."

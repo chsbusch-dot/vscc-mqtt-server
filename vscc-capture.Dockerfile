@@ -15,6 +15,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN wget -q -O /tmp/vscapture.zip "$VSCAPTURE_URL" \
+    # Integrity guard: SourceForge can serve an HTML error page (small) instead
+    # of the binary, and a truncated download would extract partially. Require a
+    # plausible size and a valid archive before extracting.
+    && [ "$(stat -c%s /tmp/vscapture.zip)" -gt 100000 ] \
+       || { echo "VSCapture download failed or too small — aborting build"; exit 1; } \
+    && unzip -tq /tmp/vscapture.zip \
     && mkdir -p /opt/vscapture \
     && unzip -q /tmp/vscapture.zip -d /opt/vscapture \
     && rm /tmp/vscapture.zip

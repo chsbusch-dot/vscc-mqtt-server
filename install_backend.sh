@@ -61,7 +61,9 @@ while ! [[ "$MONITOR_IP" =~ $IP_RE ]]; do
         say "  MONITOR_IP=192.168.1.215 $0"
         exit 1
     fi
-    MONITOR_IP=$(ask "IP of the Philips monitor [192.168.1.215]: " "192.168.1.215")
+    # No default: a guessed IP would silently capture from the wrong host, and a
+    # non-interactive run with no MONITOR_IP preset must fail rather than pick one.
+    MONITOR_IP=$(ask "IP of the Philips monitor (e.g. 192.168.1.215): " "")
 done
 
 # --- Dashboard on this host too? ---
@@ -90,7 +92,9 @@ case "$WITH_DASHBOARD" in [Yy]*) SERVICES="$SERVICES dashboard" ;; esac
 say "Starting: $SERVICES"
 $DOCKER compose up -d $SERVICES
 
-HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+# Prefer a real LAN IP: drop loopback, link-local, and Docker bridge ranges
+# (172.17–172.31) so we don't advertise the docker0 address to users.
+HOST_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -vE '^(127\.|169\.254\.|172\.1[7-9]\.|172\.2[0-9]\.|172\.3[01]\.)' | head -1)
 echo
 say "Backend is up. Monitor: $MONITOR_IP (capture starts automatically when it is on)."
 case "$WITH_DASHBOARD" in

@@ -35,7 +35,9 @@ DATA_FILE="$DATA_DIR/DataExportVSC.json"
 
 # VSCapture writes its exports next to its working set; keep binaries and data
 # together on the volume, mirroring the host install's VSCapture/ directory.
-cp -un "$BIN_DIR"/* "$DATA_DIR"/ 2>/dev/null || true
+# Use -u (update if newer/missing), NOT -n (never overwrite): otherwise an image
+# upgrade leaves the OLD VSCapture binaries on a pre-existing volume forever.
+cp -u "$BIN_DIR"/* "$DATA_DIR"/ 2>/dev/null || true
 cd "$DATA_DIR"
 
 cfg_get() { sed -n "s/^$1=//p" "$CONFIG_FILE" 2>/dev/null | head -1 | tr -d '[:space:]'; }

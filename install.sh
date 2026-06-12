@@ -182,8 +182,10 @@ echo "VSCaptureCLI is ready."
 COMPOSE_FILE="vscc-docker-compose.yml"
 
 echo "Ensuring no old containers are running..."
-# The 'down' command with -v removes volumes, ensuring a clean slate.
-docker compose -f "$COMPOSE_FILE" down -v
+# Stop existing containers but PRESERVE volumes — re-running the installer to
+# pick up an update must NOT wipe the TimescaleDB volume (recorded sessions).
+# Use the uninstall path or `docker compose down -v` manually for a clean slate.
+docker compose -f "$COMPOSE_FILE" down --remove-orphans
 
 echo "Starting backend services with Docker Compose..."
 echo "This may take a few minutes on the first run to build the worker image..."
@@ -287,7 +289,7 @@ systemctl status vscc-websocket-streamer.service --no-pager
 echo ""
 echo "Verifying MQTT message reception from MP50..."
 echo "(Listening for 5 seconds...)"
-if timeout 5 mosquitto_sub -h 127.0.0.1 -t telemetry/mp50 -C 1 -v; then
+if timeout 8 mosquitto_sub -h 127.0.0.1 -t 'mp50/#' -C 1 -v; then
     echo "MQTT verification successful. Messages are being received."
 else
     echo "Warning: No MQTT messages were received in the 5-second window."
