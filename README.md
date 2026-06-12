@@ -16,6 +16,9 @@ frontend — a React + SciChart dashboard rendering the live waveforms and vital
 
 [![MP50 Vital Sign Dashboard](https://raw.githubusercontent.com/chsbusch-dot/vscc-dashboard-client/main/docs/screenshots/dashboard-full.png)](https://github.com/chsbusch-dot/vscc-dashboard-client)
 
+- **High-frequency waveforms** — **Pleth** and **Respiration** rendered as continuous traces, plus **ECG**, **EEG**, and **BIS** channels (any new monitor module's waveform export is auto-discovered and published — no code change)
+- **Numeric vitals** — SpO₂, pulse rate, NIBP, respiration rate, heart rate, and every other numeric the monitor exports
+
 ## Quick Start
 
 ```bash
