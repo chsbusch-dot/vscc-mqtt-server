@@ -19,6 +19,7 @@ import aiomqtt
 from prometheus_client import (
     CollectorRegistry, Gauge, generate_latest, CONTENT_TYPE_LATEST,
 )
+import vscc_hrv
 
 # --- Configuration ---
 
@@ -1141,3 +1142,47 @@ async def download_session_edf(session_id: int):
 
     return StreamingResponse(_iter(), media_type="application/octet-stream",
                              headers={"Content-Disposition": f'attachment; filename="{path.parent.name}.edf"'})
+
+# --- 8. Derived ECG metrics: HRV ---
+
+MAX_ECG_SAMPLES = 6_000_000  # ~2 h at the MP50's ECG rate; guards memory
+
+@app.get("/api/sessions/{session_id}/hrv")
+async def session_hrv(session_id: int, physio_id: Optional[str] = None):
+    """Heart-rate variability for a session's ECG: R-peak detection (Pan-Tompkins)
+    → RR series → time-domain HRV (SDNN, RMSSD, pNN50) + Poincaré (SD1/SD2 and
+    plot points). Research/education only — not for diagnosis."""
+    import numpy as np
+    async with db_pool.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
+        if not r:
+            return {"error": "not found"}
+        end = r["ended_at"] or datetime.now(timezone.utc)
+        # Pick the ECG lead: caller's choice, else lead II, else any NOM_ECG_* present.
+        if physio_id is None:
+            waves = [x["physio_id"] for x in await conn.fetch(
+                "SELECT DISTINCT physio_id FROM patient_waveforms WHERE time BETWEEN $1 AND $2",
+                r["started_at"], end)]
+            ecg = [w for w in waves if w.startswith("NOM_ECG")]
+            if not ecg:
+                return {"ok": False, "error": "no ECG waveform in this session"}
+            physio_id = "NOM_ECG_ELEC_POTL_II" if "NOM_ECG_ELEC_POTL_II" in ecg else sorted(ecg)[0]
+
+        times, values, truncated = [], [], False
+        async with conn.transaction():
+            async for x in conn.cursor(
+                    "SELECT time, value FROM patient_waveforms "
+                    "WHERE physio_id = $1 AND time BETWEEN $2 AND $3 ORDER BY time, ctid",
+                    physio_id, r["started_at"], end, prefetch=100_000):
+                times.append(x["time"].timestamp())
+                values.append(float(x["value"]))
+                if len(values) >= MAX_ECG_SAMPLES:
+                    truncated = True
+                    break
+
+    if len(values) < 100:
+        return {"ok": False, "error": f"not enough {physio_id} samples to analyze", "physio_id": physio_id}
+
+    result = vscc_hrv.analyze_ecg(np.asarray(times), np.asarray(values))
+    return {"session": _session_dict(r), "physio_id": physio_id,
+            "samples": len(values), "truncated": truncated, **result}

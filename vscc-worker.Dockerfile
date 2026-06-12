@@ -9,6 +9,6 @@ ENV PYTHONUNBUFFERED=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY vscc_mqtt_timescale_worker.py .
+COPY vscc_mqtt_timescale_worker.py vscc_hrv.py ./
 
 CMD ["uvicorn", "vscc_mqtt_timescale_worker:app", "--host", "0.0.0.0", "--port", "8000"]
