@@ -91,6 +91,27 @@ Native macOS/Windows services (launchd/NSSM): not planned. Only serial/MIB
 capture would ever require them (Docker Desktop cannot pass serial ports);
 defer until someone actually asks.
 
+### Phase 2.6 — Launch sequence (agreed 2026-06-11)
+Done: both repos public + MIT + disclaimers, packaging milestone shipped and
+twice smoke-tested from zero, GHCR images public, v0.1.0 tagged, repo
+descriptions/topics set, repos pinned on the GitHub profile. Two-repo layout is
+deliberate: vscc-mqtt-server is the front door (quick start, screenshot,
+compose file); vscc-dashboard-client is the satellite. Cross-repo merge was
+rejected (no redirects for merges, distinct toolchains/audiences, licensing
+boundaries for a future open-core split).
+
+Remaining, in order:
+1. **Live-data screenshot/GIF** from a freshly-installed box (the smoke-test VM
+   is armed: power the MP50 on, capture real waveforms) — the "this machine
+   installed itself an hour ago" demo claim for the post.
+2. **Launch posts** (draft for review before anything goes public):
+   master version + a VSCapture-forum variant leading with credit/lineage.
+   Targets in order: VSCapture SourceForge forum, r/BMET /
+   r/BiomedicalEngineers, VitalDB user group, optionally Show HN.
+3. **Post-launch queue:** demo/replay mode first (visitors without hardware
+   see living charts), then the dynamic-waveform dashboard refactor when BIS
+   capture data exists.
+
 ### Phase 5 — Monetization (open-core)
 - **Community (free, OSS):** single monitor, capture → MQTT → TimescaleDB →
   dashboard, demo mode.
