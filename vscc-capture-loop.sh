@@ -20,17 +20,36 @@ DATA_FILE="$(pwd)/DataExportVSC.json"
 KILL_STAMP="$(pwd)/.vscc-abrupt-stop"
 ASSOC_TIMEOUT=90   # seconds the MP50 needs to drop a dead association
 NO_DATA_LIMIT=60   # recycle the capture if no data lands for this long
+GRACE_PERIOD=10    # seconds to let VSCapture release the association before SIGKILL
 
 CMD="$DOTNET_CMD VSCaptureCLI.dll --devices 1 --device1type 1 --device1model 1 --device1arg '-mode 2 -port $DEVICE_IP -interval 1 -export 4 -devid mp50  -waveset 12 -scale 2'"
 
+PIPE_PID=""
+WATCH_PID=""
+STOPPING=""
+
 terminate() {
-    echo "[Wrapper] Stop requested. Terminating capture process..."
+    # Guard against re-entrancy (TERM and INT, or repeated signals).
+    [ -n "$STOPPING" ] && return
+    STOPPING=1
+    echo "[Wrapper] Stop requested. Shutting capture down gracefully..."
+    # Stamp the stop time first, so even if anything below is interrupted the next
+    # start still waits out the monitor's association timeout.
     date +%s > "$KILL_STAMP"
+    # Stop our own supervisors so the silent-hang watchdog can't fire mid-shutdown.
+    [ -n "$WATCH_PID" ] && kill "$WATCH_PID" 2>/dev/null
+    [ -n "$PIPE_PID" ] && kill "$PIPE_PID" 2>/dev/null
+    # Ask the capture to exit so it can release the MP50 association cleanly.
     pkill -TERM -f "VSCaptureMP.dll" 2>/dev/null
     pkill -TERM -f "VSCaptureCLI.dll" 2>/dev/null
-    sleep 2
+    # Wait up to GRACE_PERIOD for it to actually exit before forcing the issue.
+    for _ in $(seq 1 "$GRACE_PERIOD"); do
+        pgrep -f "VSCaptureCLI.dll" > /dev/null 2>&1 || break
+        sleep 1
+    done
     pkill -KILL -f "VSCaptureMP.dll" 2>/dev/null
     pkill -KILL -f "VSCaptureCLI.dll" 2>/dev/null
+    echo "[Wrapper] Capture terminated."
     exit 0
 }
 trap terminate TERM INT
@@ -82,6 +101,8 @@ while true; do
 
         wait "$PIPE_PID"
         kill "$WATCH_PID" 2>/dev/null
+        PIPE_PID=""
+        WATCH_PID=""
         echo "[Wrapper] Capture exited. Cooling down ${ASSOC_TIMEOUT}s so the monitor can drop the association..."
         sleep "$ASSOC_TIMEOUT" &
         wait $!
