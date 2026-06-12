@@ -149,6 +149,47 @@ The worker publishes numerics to `mp50/VitalSigns` and waveforms to per-signal t
 
 VSCapture writes wall-clock **local** time into its exports. The worker and streamer parse it in the timezone given by the `MONITOR_TZ` environment variable (default `America/Los_Angeles`, set in `vscc-docker-compose.yml`) and convert to UTC before publishing or storing. If the capture host moves to another timezone, change `MONITOR_TZ` — otherwise all data lands hours offset from `NOW()` and `/api/historic` queries return nothing.
 
+### Sessions & research exports (worker REST API, :8001)
+
+Recording is organized into **sessions**: the worker opens one automatically when
+data starts flowing and closes it after a configurable silence (default 3 min),
+like a case recorder. The dashboard (VSCC Studio) manages all of this from the
+browser; the same API is available to scripts:
+
+| Endpoint | What it does |
+| --- | --- |
+| `GET /api/sessions` | List sessions (newest first) |
+| `POST /api/sessions` | Start a fresh session at the current boundary |
+| `PATCH /api/sessions/{id}` | Rename / set subject code / notes |
+| `DELETE /api/sessions/{id}` | Delete a closed session (+ its data rows) |
+| `GET /api/sessions/{id}/data` | Replay payload for the dashboard charts |
+| `GET /api/sessions/{id}/signals` | Distinct numeric/waveform signals in range |
+| `GET /api/sessions/{id}/quality` | **Loss statistics**: per-waveform nominal rate, expected vs actual samples, gap count, longest gap |
+| `POST /api/sessions/{id}/export` | Write the export package to `./sessions/` on the host |
+| `GET /api/sessions/{id}/download` | The export package as one streamed zip |
+| `GET /api/sessions/download-all` | Every session's package in one zip |
+| `GET /api/sessions/{id}/edf` | Waveforms as **EDF** (one channel per signal) for EDFbrowser / MNE / biosignal toolchains |
+| `GET` / `PUT /api/settings` | Retention hours, session gap, disk/DB usage |
+| `GET` / `PUT /api/capture-config` | VSCapture service settings (see below) |
+
+An export package contains `session.json` (metadata + the same quality/loss
+statistics), `numerics.csv|.parquet` and `waveforms.csv|.parquet`, all times ISO 8601
+UTC. EDF files are generated on demand and place samples on a per-second grid at
+each signal's measured nominal rate, so gaps stay aligned (zero-filled) and channel
+timing never drifts; values are 16-bit quantized over a symmetric range (digital
+0 = physical 0).
+
+### Configuring the capture service from the dashboard
+
+`PUT /api/capture-config` (Settings → Capture in VSCC Studio) accepts `monitor_ip`,
+`interval` (1/10/60/300 s), `waveset` (0–12), `scale` (1/2) and `devid`. The worker
+persists them and mirrors a `vscc-capture-config.conf` file onto the shared data
+volume; the capture container re-reads it before every launch and a watcher recycles
+the running capture when it changes. **Applying a change restarts the capture — data
+resumes within ~2 minutes** (change detection plus the monitor's association
+cool-down). Values in the file are validated on both ends; invalid entries fall back
+to the container's environment defaults.
+
 ## Directory Structure
 
 A brief overview of the key files and directories:
