@@ -253,7 +253,7 @@ All four validated against the live MP50 on 2026-06-12 (and the released images
 deployed to the capture box). Alarms are the one explicitly-blocked item (see
 Capture & devices).
 
-### Prioritized next features (post-spectrogram, 2026-06-12)
+### Prioritized next features (2026-06-12)
 A curated, prioritized cut of the brainstorm above — sorted by effort-vs-impact.
 The fast wins all derive new insight from signals we already capture.
 
