@@ -34,6 +34,7 @@ services:
       - DB_DSN=postgresql://postgres:password@timescaledb:5432/telemetry
       - MQTT_BROKER=vscc-emqx
       - MONITOR_TZ=${MONITOR_TZ:-UTC} # default UTC to match the capture container; override for host capture
+      - SESSION_LABEL_TZ=${SESSION_LABEL_TZ:-UTC} # localizes auto-session label text only (e.g. America/Los_Angeles); data stays UTC
     volumes:
       - ./VSCapture:/app/VSCapture
       - ./sessions:/sessions   # session exports as plain host files

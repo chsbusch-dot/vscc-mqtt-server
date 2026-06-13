@@ -142,6 +142,18 @@ DEFAULT_SETTINGS = {
 # VSCapture timestamps are wall-clock time of the capture host, not UTC.
 MONITOR_TZ = ZoneInfo(os.getenv("MONITOR_TZ", "America/Los_Angeles"))
 
+# Timezone used ONLY to render the human-readable default session label
+# (e.g. "Session 2026-06-13 11:10"). All stored timestamps stay UTC; this is
+# cosmetic. Defaults to UTC so the public image is timezone-neutral; set
+# SESSION_LABEL_TZ (e.g. America/Los_Angeles) to localize auto-session labels.
+# The dashboard's "New session" button sends a browser-local label of its own,
+# so this only governs the headless auto-session manager's default labels.
+SESSION_LABEL_TZ = ZoneInfo(os.getenv("SESSION_LABEL_TZ", "UTC"))
+
+def _default_session_label(now_utc: datetime) -> str:
+    """Default 'Session <local date/time>' label, localized to SESSION_LABEL_TZ."""
+    return f"Session {now_utc.astimezone(SESSION_LABEL_TZ).strftime('%Y-%m-%d %H:%M')}"
+
 def parse_vsc_timestamp(raw_time: str) -> Union[datetime, None]:
     if not raw_time: return None
     try: return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S.%f").replace(tzinfo=MONITOR_TZ).astimezone(timezone.utc)
@@ -690,7 +702,7 @@ async def session_manager():
                 if now - last_data_time <= gap and open_row is None:
                     row = await conn.fetchrow(
                         "INSERT INTO sessions (label, started_at) VALUES ($1, $2) RETURNING id",
-                        f"Session {now.strftime('%Y-%m-%d %H:%M')}", last_data_time)
+                        _default_session_label(now), last_data_time)
                     print(f"[Sessions] Opened session #{row['id']}")
                 elif now - last_data_time > gap and open_row is not None:
                     await conn.execute("UPDATE sessions SET ended_at = GREATEST($1, started_at) WHERE id=$2", last_data_time, open_row["id"])
@@ -753,20 +765,44 @@ async def delete_session(session_id: int, purge_data: bool = True):
     return {"ok": True, "deleted_data_rows": deleted_rows}
 
 @app.get("/api/sessions/{session_id}/data")
-async def session_data(session_id: int, max_raw_minutes: int = 15):
-    """Session data for chart replay. Waveforms come back raw for short sessions,
-    1-minute aggregated (avg) beyond max_raw_minutes to keep payloads sane."""
+async def session_data(session_id: int, agg: str = "auto", max_raw_minutes: int = 15):
+    """Session data for chart replay. `agg` selects the resolution:
+      raw   — every sample
+      1min  — 1-minute averages (waveforms from the continuous aggregate)
+      5min  — 5-minute averages (re-bucketed on the fly from the 1-min aggregate)
+      auto  — raw for spans <= max_raw_minutes, else 1-min (default; back-compat)
+    Numerics are bucketed to the same width for 1min/5min; raw otherwise."""
     async with db_pool.acquire() as conn:
         r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
         if not r:
             return {"error": "not found"}
         end = r["ended_at"] or datetime.now(timezone.utc)
         span_min = (end - r["started_at"]).total_seconds() / 60
-        numerics = await conn.fetch(
-            "SELECT time, physio_id, value FROM patient_numerics WHERE time BETWEEN $1 AND $2 ORDER BY time",
-            r["started_at"], end)
-        aggregated = span_min > max_raw_minutes
-        if aggregated:
+        # Resolve the effective waveform bucket: explicit for 1min/5min, span-based for auto.
+        # asyncpg encodes an interval param from a timedelta (a str raises DataError).
+        bucket_td = {"1min": timedelta(minutes=1), "5min": timedelta(minutes=5)}.get(agg)
+        if agg == "auto" and span_min > max_raw_minutes:
+            bucket_td = timedelta(minutes=1)
+        aggregated = bucket_td is not None
+
+        # Numerics: bucket them to match an explicit 1min/5min request; raw otherwise.
+        if agg in ("1min", "5min"):
+            numerics = await conn.fetch(
+                "SELECT time_bucket($3, time) AS time, physio_id, avg(value) AS value "
+                "FROM patient_numerics WHERE time BETWEEN $1 AND $2 GROUP BY 1, physio_id ORDER BY 1",
+                r["started_at"], end, bucket_td)
+        else:
+            numerics = await conn.fetch(
+                "SELECT time, physio_id, value FROM patient_numerics WHERE time BETWEEN $1 AND $2 ORDER BY time",
+                r["started_at"], end)
+
+        # Waveforms: 5min re-buckets the 1-min aggregate; 1min/auto read it directly; raw reads samples.
+        if agg == "5min":
+            waveforms = await conn.fetch(
+                "SELECT time_bucket('5 minutes', bucket) AS time, physio_id, avg(avg_value) AS value "
+                "FROM patient_waveforms_1min WHERE bucket BETWEEN $1 AND $2 GROUP BY 1, physio_id ORDER BY 1",
+                r["started_at"], end)
+        elif aggregated:
             waveforms = await conn.fetch(
                 "SELECT bucket AS time, physio_id, avg_value AS value FROM patient_waveforms_1min "
                 "WHERE bucket BETWEEN $1 AND $2 ORDER BY bucket", r["started_at"], end)
@@ -926,7 +962,7 @@ async def create_session(payload: Optional[Dict[str, Any]] = None):
     notes). Incoming data keeps flowing; only the session metadata boundary moves."""
     payload = payload or {}
     now = datetime.now(timezone.utc)
-    label = payload.get("label") or f"Session {now.strftime('%Y-%m-%d %H:%M')}"
+    label = payload.get("label") or _default_session_label(now)
     subject = str(payload.get("subject_code", ""))
     notes = str(payload.get("notes", ""))
     async with db_pool.acquire() as conn:
