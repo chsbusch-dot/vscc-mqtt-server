@@ -183,7 +183,7 @@ browser; the same API is available to scripts:
 | `POST` / `GET` / `DELETE /api/annotations` | Timestamped event markers (e.g. "intubation"), optionally tied to a session |
 | `GET /api/sessions/{id}/quality` | **Loss statistics**: per-waveform nominal rate, expected vs actual samples, gap count, longest gap |
 | `POST /api/sessions/{id}/export` | Write the export package to `./sessions/` on the host |
-| `GET /api/sessions/{id}/download` | The export package as one streamed zip |
+| `GET /api/sessions/{id}/download` | The export package as one streamed zip (add `?deidentify=1` for a **share-safe** package: relative timestamps, stripped label/subject/notes) |
 | `GET /api/sessions/download-all` | Every session's package in one zip |
 | `GET /api/sessions/{id}/edf` | Waveforms as **EDF** (one channel per signal) for EDFbrowser / MNE / biosignal toolchains |
 | `GET /api/sessions/{id}/hrv` | **Heart-rate variability** from the ECG (R-peaks → RR → SDNN/RMSSD/pNN50 + Poincaré) |

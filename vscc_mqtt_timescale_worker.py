@@ -789,14 +789,21 @@ def _parquet_available() -> bool:
 
 EXPORT_BATCH = 50_000  # rows per cursor prefetch / parquet batch
 
-def _session_package_dir(r) -> Path:
+def _session_package_dir(r, deidentify: bool = False) -> Path:
+    if deidentify:
+        # No label (user free-text, may carry PHI) and no date in the name.
+        return SESSIONS_DIR / f"deid-session-{r['id']}"
     slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in (r["label"] or "session"))[:60].strip("-") or "session"
     return SESSIONS_DIR / f"{r['started_at'].strftime('%Y%m%d-%H%M')}_{r['id']}_{slug}"
 
-async def _export_session_files(session_id: int) -> Dict[str, Any]:
+async def _export_session_files(session_id: int, deidentify: bool = False) -> Dict[str, Any]:
     """Write session.json + numerics/waveforms CSV (and Parquet when pyarrow is
     present) under SESSIONS_DIR. Rows are streamed from the DB with a cursor in
-    fixed-size batches, so multi-GB sessions export with flat memory."""
+    fixed-size batches, so multi-GB sessions export with flat memory.
+
+    deidentify=True produces a share-safe package: timestamps become seconds
+    relative to session start (no absolute wall-clock date/time), and the
+    user-entered label/subject_code/notes + device context are stripped."""
     pa = pq = None
     if _parquet_available():
         import pyarrow as pa
@@ -807,8 +814,11 @@ async def _export_session_files(session_id: int) -> Dict[str, Any]:
         if not r:
             return {"ok": False, "error": "not found"}
         end = r["ended_at"] or datetime.now(timezone.utc)
+        t0 = r["started_at"]
+        time_col = "time_rel_s" if deidentify else "time_utc"
+        rel = lambda t: round((t - t0).total_seconds(), 6)
 
-        out = _session_package_dir(r)
+        out = _session_package_dir(r, deidentify)
         out.mkdir(parents=True, exist_ok=True)
 
         files, counts = [], {}
@@ -816,59 +826,66 @@ async def _export_session_files(session_id: int) -> Dict[str, Any]:
             count = 0
             writer = None
             if pq:
-                schema = pa.schema([("time_utc", pa.timestamp("us", tz="UTC")),
-                                    ("physio_id", pa.string()), ("value", pa.float64())])
+                ttype = pa.float64() if deidentify else pa.timestamp("us", tz="UTC")
+                schema = pa.schema([(time_col, ttype), ("physio_id", pa.string()), ("value", pa.float64())])
                 writer = pq.ParquetWriter(out / f"{name}.parquet", schema)
             # Waveform frames share one millisecond stamp; ctid keeps intra-frame
             # samples in the order VSCapture wrote them (see EDF export note).
             order = "time, ctid" if table == "patient_waveforms" else "time"
             with open(out / f"{name}.csv", "w") as f:
-                f.write("time_utc,physio_id,value\n")
+                f.write(f"{time_col},physio_id,value\n")
                 batch = []
                 async with conn.transaction():
                     async for x in conn.cursor(
                             f"SELECT time, physio_id, value FROM {table} WHERE time BETWEEN $1 AND $2 ORDER BY {order}",
-                            r["started_at"], end, prefetch=EXPORT_BATCH):
-                        f.write(f"{x['time'].isoformat()},{x['physio_id']},{x['value']}\n")
+                            t0, end, prefetch=EXPORT_BATCH):
+                        tcell = rel(x['time']) if deidentify else x['time'].isoformat()
+                        f.write(f"{tcell},{x['physio_id']},{x['value']}\n")
                         count += 1
                         if writer:
                             batch.append(x)
                             if len(batch) >= EXPORT_BATCH:
                                 writer.write_table(pa.table(
-                                    {"time_utc": [b["time"] for b in batch],
+                                    {time_col: [(rel(b["time"]) if deidentify else b["time"]) for b in batch],
                                      "physio_id": [b["physio_id"] for b in batch],
                                      "value": [float(b["value"]) for b in batch]}, schema=schema))
                                 batch = []
                 if writer:
                     if batch:
                         writer.write_table(pa.table(
-                            {"time_utc": [b["time"] for b in batch],
+                            {time_col: [(rel(b["time"]) if deidentify else b["time"]) for b in batch],
                              "physio_id": [b["physio_id"] for b in batch],
                              "value": [float(b["value"]) for b in batch]}, schema=schema))
                     writer.close()
                     files.append(f"{name}.parquet")
             files.append(f"{name}.csv")
             counts[name] = count
-        quality = await _compute_quality(conn, r["started_at"], end)
+        quality = await _compute_quality(conn, t0, end)
 
+    if deidentify:
+        meta = {"id": r["id"], "deidentified": True, "duration_s": rel(end),
+                "time_format": "seconds from session start"}
+    else:
+        meta = {**_session_dict(r), "time_format": "ISO 8601 UTC"}
     with open(out / "session.json", "w") as f:
-        json.dump({**_session_dict(r), "exported_at": datetime.now(timezone.utc).isoformat(),
+        json.dump({**meta, "exported_at": datetime.now(timezone.utc).isoformat(),
                    "numeric_rows": counts["numerics"], "waveform_rows": counts["waveforms"],
-                   "time_format": "ISO 8601 UTC", "quality": quality}, f, indent=2)
+                   "quality": quality}, f, indent=2)
     files.insert(0, "session.json")
-    return {"ok": True, "path": str(out), "files": files,
+    return {"ok": True, "path": str(out), "files": files, "deidentified": deidentify,
             "numeric_rows": counts["numerics"], "waveform_rows": counts["waveforms"]}
 
 @app.post("/api/sessions/{session_id}/export")
-async def export_session(session_id: int):
-    return await _export_session_files(session_id)
+async def export_session(session_id: int, deidentify: bool = False):
+    return await _export_session_files(session_id, deidentify)
 
 @app.get("/api/sessions/{session_id}/download")
-async def download_session(session_id: int):
+async def download_session(session_id: int, deidentify: bool = False):
     """Full data package as a zip, streamed — the browser saves it natively and
     GB-scale packages never have to fit in memory (fresh export to disk, then a
-    chunked streaming zip of the directory)."""
-    result = await _export_session_files(session_id)
+    chunked streaming zip of the directory). deidentify=1 → share-safe package
+    (relative timestamps, stripped label/subject/notes)."""
+    result = await _export_session_files(session_id, deidentify)
     if not result.get("ok"):
         return result
     from zipstream import ZipStream  # zipstream-ng
