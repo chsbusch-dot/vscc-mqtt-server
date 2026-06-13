@@ -28,12 +28,14 @@ frontend — a React + SciChart dashboard rendering the live waveforms and vital
 
 ## ⚖️ HIPAA Compliance Disclaimer
 
-This system is architected to process and store medical telemetry containing **electronic Protected Health Information (ePHI)**.
+This system processes and stores medical telemetry that may contain **electronic Protected Health Information (ePHI)**.
 
-While the software contains controls to support **HIPAA compliance**, deploying this code does not automatically guarantee compliance. Operators are strictly responsible for:
-* Configuring secure infrastructure and encryption at rest (database & exports) and in transit (MQTT / REST).
-* Disabling verbose logging that could emit raw physiological payloads (`print()` / debug logging) in production.
+**This software does not contain any controls to support HIPAA compliance** — it provides no authentication, access control, audit logging, or encryption (in transit or at rest). Running it does **not** make a deployment HIPAA-compliant. Operators are solely responsible for:
+* Secure infrastructure — encryption in transit (MQTT / REST) and at rest (database & exports), network isolation, access control, and audit logging.
+* Disabling verbose logging (`print()` / debug logging) that could emit raw physiological payloads in production.
 * Executing their own Business Associate Agreements (BAAs) with hosting providers.
+
+Research and education use only — not a medical device.
 
 <!-- TODO: screenshot pending regeneration for the MMS-only edition — restore once captured:
 [![MP50 Vital Sign Dashboard](https://raw.githubusercontent.com/chsbusch-dot/vscc-dashboard-client/main/docs/screenshots/dashboard-full.png)](https://github.com/chsbusch-dot/vscc-dashboard-client) -->
