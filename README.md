@@ -26,7 +26,17 @@ frontend — a React + SciChart dashboard rendering the live waveforms and vital
 > consoles, or third-party telemetry/analytics services. De-identify any recording
 > before sharing it.
 
-[![MP50 Vital Sign Dashboard](https://raw.githubusercontent.com/chsbusch-dot/vscc-dashboard-client/main/docs/screenshots/dashboard-full.png)](https://github.com/chsbusch-dot/vscc-dashboard-client)
+## ⚖️ HIPAA Compliance Disclaimer
+
+This system is architected to process and store medical telemetry containing **electronic Protected Health Information (ePHI)**.
+
+While the software contains controls to support **HIPAA compliance**, deploying this code does not automatically guarantee compliance. Operators are strictly responsible for:
+* Configuring secure infrastructure and encryption at rest (database & exports) and in transit (MQTT / REST).
+* Disabling verbose logging that could emit raw physiological payloads (`print()` / debug logging) in production.
+* Executing their own Business Associate Agreements (BAAs) with hosting providers.
+
+<!-- TODO: screenshot pending regeneration for the MMS-only edition — restore once captured:
+[![MP50 Vital Sign Dashboard](https://raw.githubusercontent.com/chsbusch-dot/vscc-dashboard-client/main/docs/screenshots/dashboard-full.png)](https://github.com/chsbusch-dot/vscc-dashboard-client) -->
 
 - **High-frequency waveforms** — **Pleth** and **Respiration** rendered as continuous traces, plus **ECG** channels (any new monitor module's waveform export is auto-discovered and published — no code change)
 - **Numeric vitals** — SpO₂, pulse rate, NIBP, respiration rate, heart rate, and every other numeric the monitor exports
