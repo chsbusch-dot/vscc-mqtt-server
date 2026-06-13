@@ -33,11 +33,29 @@ services:
     environment:
       - DB_DSN=postgresql://postgres:password@timescaledb:5432/telemetry
       - MQTT_BROKER=vscc-emqx
-      - MONITOR_TZ=America/Los_Angeles # timezone of the VSCapture host clock
+      - MONITOR_TZ=${MONITOR_TZ:-UTC} # default UTC to match the capture container; override for host capture
     volumes:
       - ./VSCapture:/app/VSCapture
       - ./sessions:/sessions   # session exports as plain host files
     restart: unless-stopped
+
+  # Capture from the monitor (LAN mode). Opt-in via the "capture" profile:
+  #   MONITOR_IP=192.168.1.215 docker compose -f vscc-docker-compose.yml \
+  #       --profile capture up -d --build capture
+  # Writes the VSCapture export files into ./VSCapture, where the worker tails them.
+  capture:
+    profiles: ["capture"]
+    build:
+      context: .
+      dockerfile: vscc-capture.Dockerfile
+    environment:
+      MONITOR_IP: ${MONITOR_IP:?Set MONITOR_IP, e.g. MONITOR_IP=192.168.1.215}
+      WAVESET: ${WAVESET:-12}
+      TZ: UTC   # stamps exports in UTC; the worker's MONITOR_TZ above must match
+    volumes:
+      - ./VSCapture:/data
+    restart: unless-stopped
+    stop_grace_period: 15s
 
   # Optional: serve the React dashboard from this host (single-host install).
   # Requires the client repo checked out as a sibling directory:
