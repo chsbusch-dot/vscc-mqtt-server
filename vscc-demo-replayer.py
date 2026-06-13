@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Virtual MP50 — replays a recorded slice into VSCapture's export files so the
 whole pipeline (worker → MQTT + TimescaleDB → VSCC Studio) runs live with NO
-hardware. Lets forum visitors see real waveforms and HRV without a monitor.
+hardware. Lets forum visitors see real waveforms without a monitor.
 
 Research/education demo only — the bundled slice is de-identified sample data.
 

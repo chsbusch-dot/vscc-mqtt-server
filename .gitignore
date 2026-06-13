@@ -19,3 +19,4 @@ __pycache__/
 
 # Runtime session exports (bind-mounted output, may be many GB)
 sessions/
+.env

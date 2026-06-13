@@ -28,7 +28,7 @@ frontend — a React + SciChart dashboard rendering the live waveforms and vital
 
 [![MP50 Vital Sign Dashboard](https://raw.githubusercontent.com/chsbusch-dot/vscc-dashboard-client/main/docs/screenshots/dashboard-full.png)](https://github.com/chsbusch-dot/vscc-dashboard-client)
 
-- **High-frequency waveforms** — **Pleth** and **Respiration** rendered as continuous traces, plus **ECG**, **EEG**, and **BIS** channels (any new monitor module's waveform export is auto-discovered and published — no code change)
+- **High-frequency waveforms** — **Pleth** and **Respiration** rendered as continuous traces, plus **ECG** channels (any new monitor module's waveform export is auto-discovered and published — no code change)
 - **Numeric vitals** — SpO₂, pulse rate, NIBP, respiration rate, heart rate, and every other numeric the monitor exports
 
 ## Quick Start
@@ -49,7 +49,7 @@ it being powered on. (LAN capture mode only; serial/MIB needs a native install.)
 ### Try it without hardware (demo mode)
 
 No monitor? A **virtual MP50** replays a de-identified recorded slice through
-the real pipeline, so you get live waveforms (ECG, EEG, Pleth, Resp) and
+the real pipeline, so you get live waveforms (ECG, Pleth, Resp) and
 numerics with nothing plugged in — handy for a first look or a forum demo:
 
 ```bash
@@ -152,7 +152,7 @@ Philips MP50 ──UDP──► VSCaptureCLI ──► export files (JSON numeri
 
 ### MQTT topics and payload
 
-The worker publishes numerics to `mp50/VitalSigns` and waveforms to per-signal topics: `mp50/HF-ECG`, `mp50/HF-EEG`, `mp50/HF-PLETH`, `mp50/HF-RESP` for the common waves, and `mp50/HF-<PhysioID>` for any newly discovered waveform export. Every payload is normalized JSON:
+The worker publishes numerics to `mp50/VitalSigns` and waveforms to per-signal topics: `mp50/HF-ECG`, `mp50/HF-PLETH`, `mp50/HF-RESP` for the common waves, and `mp50/HF-<PhysioID>` for any newly discovered waveform export. Every payload is normalized JSON:
 
 ```json
 {"time": 1781219308.505, "physio_id": "NOM_PULS_OXIM_SAT_O2", "value": 96.6}
@@ -186,7 +186,6 @@ browser; the same API is available to scripts:
 | `GET /api/sessions/{id}/download` | The export package as one streamed zip (add `?deidentify=1` for a **share-safe** package: relative timestamps, stripped label/subject/notes) |
 | `GET /api/sessions/download-all` | Every session's package in one zip |
 | `GET /api/sessions/{id}/edf` | Waveforms as **EDF** (one channel per signal) for EDFbrowser / MNE / biosignal toolchains |
-| `GET /api/sessions/{id}/hrv` | **Heart-rate variability** from the ECG (R-peaks → RR → SDNN/RMSSD/pNN50 + Poincaré) |
 | `GET` / `PUT /api/settings` | Retention hours, session gap, disk/DB usage |
 | `GET` / `PUT /api/capture-config` | VSCapture service settings (see below) |
 
@@ -386,7 +385,7 @@ sudo systemctl start vscc-capture-cli
 
 ## Raw Data Spot-Check
 
-`VSCaptureCLI` produces multi-GB waveform CSVs (ECG, EEG, PLETH, RESP) plus a
+`VSCaptureCLI` produces multi-GB waveform CSVs (ECG, PLETH, RESP) plus a
 numerics JSON. To tell whether an export holds a **real vital-sign trace** or is
 just a **flatline / noise** — without reading the whole file — use
 `vscc-rawdata-spotcheck.py`. It never loads more than a few MB into memory.

@@ -171,7 +171,7 @@ Remaining, in order:
 - ✅ **Shipped** — Chart annotations: add/list/delete event markers from the UI.
   *(Live-chart vertical-line overlay still pending.)*
 - ❌ **Not possible** — Alarm history lane (depends on alarm capture above).
-- ✅ **Shipped** — Health status indicator + HRV view (Poincaré).
+- ✅ **Shipped** — Health status indicator.
 - Saved/custom layouts; touch/tablet mode; PDF/PNG case report export.
 - Signal-quality indicators (lead-off, gap shading on the trace).
 
@@ -182,8 +182,6 @@ math is fine for display-time transforms.)
 
 **ECG**
 - R-peak detection (Pan-Tompkins) → beat-to-beat HR.
-- HRV suite: SDNN, RMSSD, pNN50, LF/HF (Welch PSD), Poincaré plot
-  (extends the existing PPI plot).
 - QT/QTc trending; simple arrhythmia flags (research-only labeling).
 
 **PPG / PLETH**
@@ -194,18 +192,12 @@ math is fine for display-time transforms.)
 **Respiration**
 - Rate from waveform; apnea/irregularity flags (research-only); RSA estimate.
 
-**EEG / BIS**
-- Full spectrogram view (extend the existing toggle), band-power trends
-  (delta/theta/alpha/beta already exported), spectral edge frequency,
-  burst-suppression ratio plotting.
-
 **Hemodynamics**
 - MAP trend bands, shock index (HR/SBP), rate-pressure product.
 
 **Cross-signal & statistical**
 - Generic FFT/PSD viewer for any waveform window.
-- Rolling percentile bands; z-score anomaly highlighting; short-horizon trend
-  forecast.
+- Rolling percentile bands; short-horizon trend forecast.
 - Time-in-range metrics (e.g., SpO₂ < 90 % duration) and per-session summary
   statistics.
 - ML hooks: export sliding windows to ONNX models (research models only, e.g.
@@ -218,7 +210,7 @@ Status: deferred until informed by real capture data; do on a feature branch
 The dashboard's state model is hardcoded to exactly five waveforms:
 
 ```ts
-export type WaveformId = 'VitalSigns' | 'ECG' | 'EEG' | 'Pleth' | 'Resp';  // closed union
+export type WaveformId = 'VitalSigns' | 'ECG' | 'Pleth' | 'Resp';  // closed union
 globalWaveformToggles: Record<WaveformId, boolean>   // toggles keyed by those 5
 providerMappings:      Record<WaveformId, ...>       // topics keyed by those 5
 fileInputs / uploadProgress: Record<WaveformId, ...> // ditto
@@ -254,50 +246,42 @@ live stack → merge.
 ### Suggested quick wins (high value / low effort) — ✅ ALL SHIPPED 2026-06-12
 1. ✅ Disconnect/gap watchdog notification (backend) — logs capture-liveness transitions.
 2. ✅ EDF + Parquet export endpoint — instantly research-credible.
-3. ✅ HRV metrics + Poincaré from existing ECG stream — flagship "advanced" demo.
-4. ✅ Replay/demo mode — unlocks no-hardware demos and CI.
-5. ✅ Chart annotations — add/list/delete event markers from the UI.
+3. ✅ Replay/demo mode — unlocks no-hardware demos and CI.
+4. ✅ Chart annotations — add/list/delete event markers from the UI.
 
-All five validated against the live MP50 on 2026-06-12 (and the released images
+All four validated against the live MP50 on 2026-06-12 (and the released images
 deployed to the capture box). Alarms are the one explicitly-blocked item (see
-Capture & devices). **EEG spectrogram also shipped** 2026-06-12 (STFT heatmap +
-δ/θ/α/β band power + SEF95, live-validated) — dashboard PR #8.
+Capture & devices).
 
 ### Prioritized next features (post-spectrogram, 2026-06-12)
 A curated, prioritized cut of the brainstorm above — sorted by effort-vs-impact.
-The fast wins all derive new insight from signals we already capture (the pattern
-that shipped HRV and the spectrogram).
+The fast wins all derive new insight from signals we already capture.
 
 **🔥 Top picks — cheap now, high wow**
 1. **Pulse Transit Time (PTT)** — delay from the ECG R-peak to the pleth foot; a
    cuffless surrogate for a blood-pressure *trend* from two signals we already
-   have. Reuses the HRV R-peak detector. High demo value, hot research topic.
-2. **Frequency-domain HRV (LF/HF)** — run the (already-written, tested) FFT in
-   `stft.ts` on the RR series → LF/HF power + LF/HF ratio (autonomic balance).
-   Nearly free; rounds out the HRV view.
-3. **Burst-suppression ratio (EEG)** — pairs with the new spectrogram
-   (anaesthetic depth); the EEG pipeline already exists, so it's a small add.
+   have. Reuses the R-peak detector. High demo value, hot research topic.
 
 **Strong — slightly bigger**
-4. **Pleth Variability Index (PVI)** — respiratory variation in pleth amplitude →
+2. **Pleth Variability Index (PVI)** — respiratory variation in pleth amplitude →
    fluid-responsiveness research metric.
-5. **ECG/Pleth-derived respiration (EDR)** — recover respiratory rate from a signal
+3. **ECG/Pleth-derived respiration (EDR)** — recover respiratory rate from a signal
    that doesn't directly measure it; validate against the real RESP channel.
-6. **QT/QTc trending** — R- and T-wave detection → drug-safety-style ECG monitoring.
+4. **QT/QTc trending** — R- and T-wave detection → drug-safety-style ECG monitoring.
 
 **Research-credibility / workflow (broad forum-launch appeal)**
-7. **PDF/PNG case-report export** — charts + session stats + HRV/spectrogram +
+5. **PDF/PNG case-report export** — charts + session stats +
    annotations in one shareable report. Highly practical for researchers/vets.
-8. **Session replay with scrubber + speed control** — drag a timeline, 1×/4×/16×.
+6. **Session replay with scrubber + speed control** — drag a timeline, 1×/4×/16×.
    Demo-friendly, commonly requested.
-9. **VitalDB import/export** — interop with the big open physiological dataset;
+7. **VitalDB import/export** — interop with the big open physiological dataset;
    instant credibility + a community hook for the forum posts.
-10. **Time-in-range / event stats** — e.g. "SpO₂ < 90 % for 4 min", per-session
+8. **Time-in-range / event stats** — e.g. "SpO₂ < 90 % for 4 min", per-session
     summary. Easy, useful.
 
 **Polish**
-11. Signal-quality / gap shading on the traces; z-score anomaly highlighting;
+9. Signal-quality / gap shading on the traces;
     saved/custom layouts; de-identification-for-sharing pipeline.
 
-Suggested order: **PTT → LF/HF HRV → PDF report export** (BP-trend wow, near-free
-HRV extension, and the thing that makes a case actually shareable).
+Suggested order: **PTT → PDF report export** (BP-trend wow, and the thing that
+makes a case actually shareable).

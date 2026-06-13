@@ -8,5 +8,3 @@ tzdata
 pyarrow
 zipstream-ng
 prometheus-client
-numpy
-scipy
