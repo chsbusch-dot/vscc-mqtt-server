@@ -259,6 +259,45 @@ live stack → merge.
 5. ✅ Chart annotations — add/list/delete event markers from the UI.
 
 All five validated against the live MP50 on 2026-06-12 (and the released images
-deployed to the capture box). The remaining advanced-calculations backlog
-(HRV frequency-domain/LF-HF, PPG/PTT, EEG spectrogram, hemodynamics, etc.) is
-unchanged above. Alarms are the one explicitly-blocked item (see Capture & devices).
+deployed to the capture box). Alarms are the one explicitly-blocked item (see
+Capture & devices). **EEG spectrogram also shipped** 2026-06-12 (STFT heatmap +
+δ/θ/α/β band power + SEF95, live-validated) — dashboard PR #8.
+
+### Prioritized next features (post-spectrogram, 2026-06-12)
+A curated, prioritized cut of the brainstorm above — sorted by effort-vs-impact.
+The fast wins all derive new insight from signals we already capture (the pattern
+that shipped HRV and the spectrogram).
+
+**🔥 Top picks — cheap now, high wow**
+1. **Pulse Transit Time (PTT)** — delay from the ECG R-peak to the pleth foot; a
+   cuffless surrogate for a blood-pressure *trend* from two signals we already
+   have. Reuses the HRV R-peak detector. High demo value, hot research topic.
+2. **Frequency-domain HRV (LF/HF)** — run the (already-written, tested) FFT in
+   `stft.ts` on the RR series → LF/HF power + LF/HF ratio (autonomic balance).
+   Nearly free; rounds out the HRV view.
+3. **Burst-suppression ratio (EEG)** — pairs with the new spectrogram
+   (anaesthetic depth); the EEG pipeline already exists, so it's a small add.
+
+**Strong — slightly bigger**
+4. **Pleth Variability Index (PVI)** — respiratory variation in pleth amplitude →
+   fluid-responsiveness research metric.
+5. **ECG/Pleth-derived respiration (EDR)** — recover respiratory rate from a signal
+   that doesn't directly measure it; validate against the real RESP channel.
+6. **QT/QTc trending** — R- and T-wave detection → drug-safety-style ECG monitoring.
+
+**Research-credibility / workflow (broad forum-launch appeal)**
+7. **PDF/PNG case-report export** — charts + session stats + HRV/spectrogram +
+   annotations in one shareable report. Highly practical for researchers/vets.
+8. **Session replay with scrubber + speed control** — drag a timeline, 1×/4×/16×.
+   Demo-friendly, commonly requested.
+9. **VitalDB import/export** — interop with the big open physiological dataset;
+   instant credibility + a community hook for the forum posts.
+10. **Time-in-range / event stats** — e.g. "SpO₂ < 90 % for 4 min", per-session
+    summary. Easy, useful.
+
+**Polish**
+11. Signal-quality / gap shading on the traces; z-score anomaly highlighting;
+    saved/custom layouts; de-identification-for-sharing pipeline.
+
+Suggested order: **PTT → LF/HF HRV → PDF report export** (BP-trend wow, near-free
+HRV extension, and the thing that makes a case actually shareable).
