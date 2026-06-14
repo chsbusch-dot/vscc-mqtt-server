@@ -790,6 +790,11 @@ async def session_data(session_id: int, agg: str = "auto", max_raw_minutes: int 
       5min  — 5-minute averages (re-bucketed on the fly from the 1-min aggregate)
       auto  — raw for spans <= max_raw_minutes, else 1-min (default; back-compat)
     Numerics are bucketed to the same width for 1min/5min; raw otherwise."""
+    # Clamp the raw ceiling: it's unauthenticated query input and is the sole gate
+    # on the raw-waveform path, so without this an explicit agg=raw with a huge
+    # max_raw_minutes would still pull millions of rows (the OOM/DoS the agg cap
+    # closes). 60 min of raw is already more than a chart can render.
+    max_raw_minutes = max(1, min(int(max_raw_minutes), 60))
     async with db_pool.acquire() as conn:
         r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
         if not r:
@@ -833,8 +838,12 @@ async def session_data(session_id: int, agg: str = "auto", max_raw_minutes: int 
                 "SELECT time, physio_id, value FROM patient_waveforms WHERE time BETWEEN $1 AND $2 ORDER BY time, ctid",
                 r["started_at"], end)
     fmt = lambda rows: [{"time": x["time"].timestamp(), "physio_id": x["physio_id"], "value": float(x["value"])} for x in rows]
+    # Build the (potentially large) row lists off the event loop so a raw replay
+    # doesn't block telemetry ingest and other requests during serialization.
+    num_out, wave_out = await asyncio.gather(
+        asyncio.to_thread(fmt, numerics), asyncio.to_thread(fmt, waveforms))
     return {"session": _session_dict(r), "aggregated_waveforms": aggregated,
-            "numerics": fmt(numerics), "waveforms": fmt(waveforms)}
+            "numerics": num_out, "waveforms": wave_out}
 
 def _parquet_available() -> bool:
     try:
