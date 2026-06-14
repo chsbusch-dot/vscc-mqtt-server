@@ -447,6 +447,9 @@ async def get_historic_data(range_minutes: int):
     The React UI hits this when zooming out past the live window.
     range_minutes is coerced to int by FastAPI, so it is safe to inline.
     """
+    # Clamp to a sane window: negatives produce a future (empty) window, and an
+    # unbounded value would full-scan the whole hypertable on an open endpoint.
+    range_minutes = max(1, min(int(range_minutes), 10080))  # 1 minute .. 7 days
     query = f"""
         SELECT time, physio_id, value
         FROM patient_numerics
@@ -501,6 +504,21 @@ async def read_settings():
 @app.put("/api/settings")
 async def write_settings(payload: Dict[str, Any]):
     allowed = {k: str(v) for k, v in payload.items() if k in DEFAULT_SETTINGS}
+    # Validate numeric settings BEFORE persisting — a non-numeric value would
+    # otherwise be stored and then break the session manager / retention loop on
+    # every tick (it reads these back) until the row is hand-fixed.
+    if "retention_hours" in allowed:
+        try:
+            if int(allowed["retention_hours"]) <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            return {"ok": False, "error": "retention_hours must be a positive integer"}
+    if "session_gap_minutes" in allowed:
+        try:
+            if float(allowed["session_gap_minutes"]) <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            return {"ok": False, "error": "session_gap_minutes must be a positive number"}
     async with db_pool.acquire() as conn:
         for k, v in allowed.items():
             await conn.execute(
@@ -781,7 +799,11 @@ async def session_data(session_id: int, agg: str = "auto", max_raw_minutes: int 
         # Resolve the effective waveform bucket: explicit for 1min/5min, span-based for auto.
         # asyncpg encodes an interval param from a timedelta (a str raises DataError).
         bucket_td = {"1min": timedelta(minutes=1), "5min": timedelta(minutes=5)}.get(agg)
-        if agg == "auto" and span_min > max_raw_minutes:
+        # Any request that didn't resolve to an explicit bucket (raw, auto, OR an
+        # unknown/typo'd agg) downshifts to 1-min beyond max_raw_minutes, so no
+        # request — UI, direct, or malformed — can pull millions of raw rows into
+        # one response (an OOM/DoS of the worker). aggregated_waveforms reports it.
+        if bucket_td is None and span_min > max_raw_minutes:
             bucket_td = timedelta(minutes=1)
         aggregated = bucket_td is not None
 
@@ -830,10 +852,12 @@ def _session_package_dir(r, deidentify: bool = False) -> Path:
     slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in (r["label"] or "session"))[:60].strip("-") or "session"
     return SESSIONS_DIR / f"{r['started_at'].strftime('%Y%m%d-%H%M')}_{r['id']}_{slug}"
 
-async def _export_session_files(session_id: int, deidentify: bool = False) -> Dict[str, Any]:
+async def _export_session_files(session_id: int, deidentify: bool = False,
+                                base_dir: Optional[Path] = None) -> Dict[str, Any]:
     """Write session.json + numerics/waveforms CSV (and Parquet when pyarrow is
-    present) under SESSIONS_DIR. Rows are streamed from the DB with a cursor in
-    fixed-size batches, so multi-GB sessions export with flat memory.
+    present). Rows are streamed from the DB with a cursor in fixed-size batches,
+    so multi-GB sessions export with flat memory. base_dir overrides SESSIONS_DIR
+    (used by download-all to export into a throwaway temp dir).
 
     deidentify=True produces a share-safe package: timestamps become seconds
     relative to session start (no absolute wall-clock date/time), and the
@@ -853,6 +877,8 @@ async def _export_session_files(session_id: int, deidentify: bool = False) -> Di
         rel = lambda t: round((t - t0).total_seconds(), 6)
 
         out = _session_package_dir(r, deidentify)
+        if base_dir is not None:
+            out = base_dir / out.name
         out.mkdir(parents=True, exist_ok=True)
 
         files, counts = [], {}
@@ -895,6 +921,31 @@ async def _export_session_files(session_id: int, deidentify: bool = False) -> Di
             files.append(f"{name}.csv")
             counts[name] = count
         quality = await _compute_quality(conn, t0, end)
+        # Retention truncation: if the earliest surviving row is later than the
+        # session start, part of the session has aged out of the DB (retention
+        # drops whole chunks oldest-first). Flag it so the package isn't silently
+        # mistaken for the complete recording.
+        min_surviving = await conn.fetchval(
+            "SELECT min(t) FROM ("
+            " SELECT min(time) AS t FROM patient_numerics WHERE time BETWEEN $1 AND $2"
+            " UNION ALL SELECT min(time) FROM patient_waveforms WHERE time BETWEEN $1 AND $2) q",
+            t0, end)
+        # Threshold well above normal start-up / export-interval latency (so a
+        # complete session isn't mislabelled) but far below the retention window
+        # (a truncated session's first surviving row is hours after start).
+        partial = bool(min_surviving and (min_surviving - t0).total_seconds() > 600.0)
+        retained_from_s = rel(min_surviving) if (partial and min_surviving) else 0.0
+
+    # The quality block carries absolute epoch first_sample/last_sample. In a
+    # de-identified package those would recover the exact wall-clock recording
+    # time, so relativize them to seconds-from-start like every other timestamp.
+    if deidentify:
+        t0_epoch = t0.timestamp()
+        for grp in ("waveforms", "numerics"):
+            for item in quality.get(grp, []):
+                for k in ("first_sample", "last_sample"):
+                    if item.get(k) is not None:
+                        item[k] = round(item[k] - t0_epoch, 6)
 
     if deidentify:
         meta = {"id": r["id"], "deidentified": True, "duration_s": rel(end),
@@ -903,11 +954,12 @@ async def _export_session_files(session_id: int, deidentify: bool = False) -> Di
         meta = {**_session_dict(r), "time_format": "ISO 8601 UTC"}
     with open(out / "session.json", "w") as f:
         json.dump({**meta, "exported_at": datetime.now(timezone.utc).isoformat(),
+                   "partial": partial, "retained_from_s": retained_from_s,
                    "numeric_rows": counts["numerics"], "waveform_rows": counts["waveforms"],
                    "quality": quality}, f, indent=2)
     files.insert(0, "session.json")
     return {"ok": True, "path": str(out), "files": files, "deidentified": deidentify,
-            "numeric_rows": counts["numerics"], "waveform_rows": counts["waveforms"]}
+            "partial": partial, "numeric_rows": counts["numerics"], "waveform_rows": counts["waveforms"]}
 
 @app.post("/api/sessions/{session_id}/export")
 async def export_session(session_id: int, deidentify: bool = False):
@@ -930,30 +982,46 @@ async def download_session(session_id: int, deidentify: bool = False):
                              headers={"Content-Disposition": f'attachment; filename="{out.name}.zip"'})
 
 @app.get("/api/sessions/download-all")
-async def download_all_sessions():
-    """One zip of every session's export package. Sessions that still have rows
-    in the DB are fresh-exported first; sessions whose data already aged out of
-    retention keep their existing export folders untouched (re-exporting them
-    would clobber good files with empty ones). The whole sessions directory is
-    then streamed as a single chunked zip."""
+async def download_all_sessions(deidentify: bool = False):
+    """One zip of every session that still has data, each fresh-exported into a
+    throwaway temp dir and only that dir is zipped. This honours `deidentify`
+    for the whole bundle (so it can't silently leak PHI), and avoids both
+    sweeping stale/leftover folders out of SESSIONS_DIR and clobbering existing
+    complete packages with retention-truncated re-exports. The temp dir is
+    removed once streaming finishes."""
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT id, started_at, ended_at FROM sessions ORDER BY id")
-    for r in rows:
-        end = r["ended_at"] or datetime.now(timezone.utc)
-        async with db_pool.acquire() as conn:
-            has_data = await conn.fetchval(
-                "SELECT EXISTS (SELECT 1 FROM patient_numerics WHERE time BETWEEN $1 AND $2 LIMIT 1)"
-                " OR EXISTS (SELECT 1 FROM patient_waveforms WHERE time BETWEEN $1 AND $2 LIMIT 1)",
-                r["started_at"], end)
-        if has_data:
-            await _export_session_files(r["id"])
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    from zipstream import ZipStream  # zipstream-ng
-    import zipfile as _zf
-    zs = ZipStream.from_path(SESSIONS_DIR, compress_type=_zf.ZIP_DEFLATED, compress_level=1)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
-    return StreamingResponse(iter(zs), media_type="application/zip",
-                             headers={"Content-Disposition": f'attachment; filename="vscc-sessions-{stamp}.zip"'})
+    tmp = Path(tempfile.mkdtemp(dir=str(SESSIONS_DIR), prefix="download-all-"))
+    try:
+        for r in rows:
+            end = r["ended_at"] or datetime.now(timezone.utc)
+            async with db_pool.acquire() as conn:
+                has_data = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM patient_numerics WHERE time BETWEEN $1 AND $2 LIMIT 1)"
+                    " OR EXISTS (SELECT 1 FROM patient_waveforms WHERE time BETWEEN $1 AND $2 LIMIT 1)",
+                    r["started_at"], end)
+            if has_data:
+                await _export_session_files(r["id"], deidentify, base_dir=tmp)
+        from zipstream import ZipStream  # zipstream-ng
+        import zipfile as _zf
+        zs = ZipStream(compress_type=_zf.ZIP_DEFLATED, compress_level=1)
+        for child in sorted(tmp.iterdir()):
+            zs.add_path(child, arcname=child.name)  # session folders at the zip root, no temp-dir prefix
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+        suffix = "-deid" if deidentify else ""
+
+        def stream_then_cleanup():
+            try:
+                yield from zs
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        return StreamingResponse(stream_then_cleanup(), media_type="application/zip",
+                                 headers={"Content-Disposition": f'attachment; filename="vscc-sessions-{stamp}{suffix}.zip"'})
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
 
 @app.post("/api/sessions")
 async def create_session(payload: Optional[Dict[str, Any]] = None):
@@ -1028,7 +1096,10 @@ WITH b AS (
 SELECT physio_id,
        sum(n)::bigint                                     AS samples,
        count(*)::bigint                                   AS seconds_with_data,
-       mode() WITHIN GROUP (ORDER BY n)                   AS rate_hz,
+       -- 90th percentile of per-second counts: equals the nominal rate for any
+       -- normal capture (most seconds are full) but, unlike mode(), is not thrown
+       -- off by partial-second counts dominating a very short capture.
+       percentile_disc(0.9) WITHIN GROUP (ORDER BY n)     AS rate_hz,
        min(sec)                                           AS first_sec,
        max(sec)                                           AS last_sec,
        count(*) FILTER (WHERE step > 1)                   AS gap_count,
@@ -1047,7 +1118,7 @@ async def _compute_quality(conn, started_at, end) -> Dict[str, Any]:
             "samples": int(r["samples"]),
             "expected_samples": expected,
             "missing_samples": max(0, expected - int(r["samples"])),
-            "completeness_pct": round(100.0 * int(r["samples"]) / expected, 2) if expected else None,
+            "completeness_pct": round(min(100.0, 100.0 * int(r["samples"]) / expected), 2) if expected else None,
             "gap_count": int(r["gap_count"]),
             "longest_gap_s": float(r["longest_gap_s"]),
             "first_sample": r["first_sec"].timestamp(),
@@ -1228,13 +1299,25 @@ async def create_annotation(payload: Dict[str, Any]):
     label = str(payload.get("label", "")).strip()
     if not label:
         return {"ok": False, "error": "label is required"}
+    # Validate client-supplied time/session_id up front so malformed input returns
+    # {ok:false} instead of surfacing as an unhandled 500.
     ts = payload.get("time")
-    when = datetime.fromtimestamp(float(ts), timezone.utc) if ts is not None else datetime.now(timezone.utc)
+    try:
+        when = datetime.fromtimestamp(float(ts), timezone.utc) if ts is not None else datetime.now(timezone.utc)
+    except (ValueError, TypeError, OverflowError, OSError):
+        return {"ok": False, "error": "time must be epoch seconds"}
     session_id = payload.get("session_id")
-    async with db_pool.acquire() as conn:
-        r = await conn.fetchrow(
-            "INSERT INTO annotations (time, label, session_id) VALUES ($1, $2, $3) RETURNING *",
-            when, label[:500], int(session_id) if session_id is not None else None)
+    try:
+        sid = int(session_id) if session_id is not None else None
+    except (ValueError, TypeError):
+        return {"ok": False, "error": "session_id must be an integer"}
+    try:
+        async with db_pool.acquire() as conn:
+            r = await conn.fetchrow(
+                "INSERT INTO annotations (time, label, session_id) VALUES ($1, $2, $3) RETURNING *",
+                when, label[:500], sid)
+    except asyncpg.ForeignKeyViolationError:
+        return {"ok": False, "error": f"session #{sid} does not exist"}
     return _annotation_dict(r)
 
 @app.get("/api/annotations")
