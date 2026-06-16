@@ -103,6 +103,32 @@ def test_unknown_agg_is_safe(client, longest_session):
     assert "waveforms" in d and "numerics" in d  # no server error
 
 
+def test_windowed_load_returns_only_the_window(client, longest_session):
+    if not longest_session:
+        pytest.skip("no closed session")
+    sid = longest_session["id"]
+    start, end = longest_session["started_at"], longest_session["ended_at"]
+    if end - start < 200:
+        pytest.skip("need a session longer than the test windows")
+    # Compare two raw windows both narrow enough to stay raw (no downshift), so the
+    # only variable is the window width: a wider window must return more rows, and
+    # each window's data must be confined to it.
+    narrow = client.get(f"/api/sessions/{sid}/data",
+                        params={"agg": "raw", "from_ts": start + 60, "to_ts": start + 90}).json()   # 30s
+    wide = client.get(f"/api/sessions/{sid}/data",
+                      params={"agg": "raw", "from_ts": start + 60, "to_ts": start + 180}).json()    # 120s
+    assert narrow["aggregated_waveforms"] is False and wide["aggregated_waveforms"] is False
+    assert len(narrow["waveforms"]) < len(wide["waveforms"])
+    if narrow["waveforms"]:
+        ts = [r["time"] for r in narrow["waveforms"]]
+        assert min(ts) >= start + 59 and max(ts) <= start + 91  # confined to its window
+
+    # Out-of-range window clamps to the session rather than erroring.
+    clamped = client.get(f"/api/sessions/{sid}/data",
+                         params={"agg": "1min", "from_ts": 0, "to_ts": start + 180})
+    assert clamped.status_code == 200 and "waveforms" in clamped.json()
+
+
 def test_raw_with_huge_max_raw_minutes_is_clamped(client, longest_session):
     if not longest_session:
         pytest.skip("no closed session")

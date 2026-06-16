@@ -783,13 +783,18 @@ async def delete_session(session_id: int, purge_data: bool = True):
     return {"ok": True, "deleted_data_rows": deleted_rows}
 
 @app.get("/api/sessions/{session_id}/data")
-async def session_data(session_id: int, agg: str = "auto", max_raw_minutes: int = 15):
+async def session_data(session_id: int, agg: str = "auto", max_raw_minutes: int = 15,
+                       from_ts: Optional[float] = None, to_ts: Optional[float] = None):
     """Session data for chart replay. `agg` selects the resolution:
       raw   — every sample
       1min  — 1-minute averages (waveforms from the continuous aggregate)
       5min  — 5-minute averages (re-bucketed on the fly from the 1-min aggregate)
       auto  — raw for spans <= max_raw_minutes, else 1-min (default; back-compat)
-    Numerics are bucketed to the same width for 1min/5min; raw otherwise."""
+    Numerics are bucketed to the same width for 1min/5min; raw otherwise.
+
+    Optional from_ts/to_ts (epoch seconds) load only that window of the session
+    instead of the whole thing — the basis for windowed / level-of-detail loading
+    of long recordings. The window is clamped to the session's own range."""
     # Clamp the raw ceiling: it's unauthenticated query input and is the sole gate
     # on the raw-waveform path, so without this an explicit agg=raw with a huge
     # max_raw_minutes would still pull millions of rows (the OOM/DoS the agg cap
@@ -799,8 +804,18 @@ async def session_data(session_id: int, agg: str = "auto", max_raw_minutes: int 
         r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
         if not r:
             return {"error": "not found"}
-        end = r["ended_at"] or datetime.now(timezone.utc)
-        span_min = (end - r["started_at"]).total_seconds() / 60
+        sess_start = r["started_at"]
+        sess_end = r["ended_at"] or datetime.now(timezone.utc)
+        # Optional [from_ts, to_ts] window, clamped to the session range. Lets the
+        # client load only the visible span + margin of a long recording.
+        try:
+            win_start = sess_start if from_ts is None else max(sess_start, datetime.fromtimestamp(float(from_ts), timezone.utc))
+            win_end = sess_end if to_ts is None else min(sess_end, datetime.fromtimestamp(float(to_ts), timezone.utc))
+        except (ValueError, TypeError, OverflowError, OSError):
+            return {"error": "from_ts/to_ts must be epoch seconds"}
+        if win_end < win_start:
+            win_start = win_end  # inverted window -> empty result rather than an error
+        span_min = (win_end - win_start).total_seconds() / 60
         # Resolve the effective waveform bucket: explicit for 1min/5min, span-based for auto.
         # asyncpg encodes an interval param from a timedelta (a str raises DataError).
         bucket_td = {"1min": timedelta(minutes=1), "5min": timedelta(minutes=5)}.get(agg)
@@ -817,26 +832,26 @@ async def session_data(session_id: int, agg: str = "auto", max_raw_minutes: int 
             numerics = await conn.fetch(
                 "SELECT time_bucket($3, time) AS time, physio_id, avg(value) AS value "
                 "FROM patient_numerics WHERE time BETWEEN $1 AND $2 GROUP BY 1, physio_id ORDER BY 1",
-                r["started_at"], end, bucket_td)
+                win_start, win_end, bucket_td)
         else:
             numerics = await conn.fetch(
                 "SELECT time, physio_id, value FROM patient_numerics WHERE time BETWEEN $1 AND $2 ORDER BY time",
-                r["started_at"], end)
+                win_start, win_end)
 
         # Waveforms: 5min re-buckets the 1-min aggregate; 1min/auto read it directly; raw reads samples.
         if agg == "5min":
             waveforms = await conn.fetch(
                 "SELECT time_bucket('5 minutes', bucket) AS time, physio_id, avg(avg_value) AS value "
                 "FROM patient_waveforms_1min WHERE bucket BETWEEN $1 AND $2 GROUP BY 1, physio_id ORDER BY 1",
-                r["started_at"], end)
+                win_start, win_end)
         elif aggregated:
             waveforms = await conn.fetch(
                 "SELECT bucket AS time, physio_id, avg_value AS value FROM patient_waveforms_1min "
-                "WHERE bucket BETWEEN $1 AND $2 ORDER BY bucket", r["started_at"], end)
+                "WHERE bucket BETWEEN $1 AND $2 ORDER BY bucket", win_start, win_end)
         else:
             waveforms = await conn.fetch(
                 "SELECT time, physio_id, value FROM patient_waveforms WHERE time BETWEEN $1 AND $2 ORDER BY time, ctid",
-                r["started_at"], end)
+                win_start, win_end)
     fmt = lambda rows: [{"time": x["time"].timestamp(), "physio_id": x["physio_id"], "value": float(x["value"])} for x in rows]
     # Build the (potentially large) row lists off the event loop so a raw replay
     # doesn't block telemetry ingest and other requests during serialization.
