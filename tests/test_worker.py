@@ -36,7 +36,6 @@ def test_physio_id_from_wave_file_nonstandard_falls_back_to_stem():
 @pytest.mark.parametrize("physio_id,expected", [
     # Known aliases keep the existing short dashboard topics.
     ("NOM_ECG_ELEC_POTL_II", "mp50/HF-ECG"),
-    ("NOM_EEG_ELEC_POTL_CRTX", "mp50/HF-EEG"),
     ("NOM_PLETH", "mp50/HF-PLETH"),
     ("NOM_RESP", "mp50/HF-RESP"),
 ])
@@ -46,8 +45,10 @@ def test_wave_topic_known_aliases(physio_id, expected):
 
 def test_wave_topic_unknown_nom_id_slugifies():
     # A brand-new module (e.g. BIS connected mid-session) must still get a topic
-    # with no code change -- this is the whole point of auto-discovery.
+    # with no code change -- this is the whole point of auto-discovery. Neuro/EEG
+    # was dropped from the community (MMS-only) build, so EEG now takes this path.
     assert w.wave_topic("NOM_BIS_INDEX") == "mp50/HF-BIS_INDEX"
+    assert w.wave_topic("NOM_EEG_ELEC_POTL_CRTX") == "mp50/HF-EEG_ELEC_POTL_CRTX"
 
 
 def test_wave_topic_non_nom_id_slugifies():

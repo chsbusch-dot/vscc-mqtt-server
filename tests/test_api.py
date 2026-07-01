@@ -12,6 +12,7 @@ If no worker is reachable, the suite skips. Mutating tests only exercise the
 *rejection* paths (bad input), so they never persist test data.
 """
 import os
+
 import httpx
 import pytest
 

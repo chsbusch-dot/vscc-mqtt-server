@@ -20,7 +20,7 @@ ignore = ["E701", "E702"]
 # production code in the same commit that adds CI, we grandfather their debt
 # and pay it down under its own tracked ticket (Linear WOR: worker lint debt).
 # NEW code (tests/, future modules) is held to the full rule set above.
-"vscc_mqtt_timescale_worker.py" = ["E501", "F401", "F541", "I001", "B007"]
+"vscc_mqtt_timescale_worker.py" = ["E501", "F401", "F541", "I001", "B007", "B905", "E731"]
 "vscc-rawdata-spotcheck.py" = ["E501", "F401", "F541", "I001", "B007"]
 "vscc-rawdata-format-probe.py" = ["E501", "F401", "F541", "I001", "B007"]
 "vscc-websocket-streamer.py" = ["E501", "F401", "F541", "I001", "B007"]
