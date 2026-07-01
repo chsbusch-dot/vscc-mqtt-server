@@ -15,7 +15,6 @@ MAX_SIZE_BYTES = 20 * 1024 * 1024
 # Truncating binaries, DLLs, or runtime configs would corrupt them.
 FILES_TO_CLEAN = [
     "NOM_ECG_ELEC_POTL_IIWaveExport.csv",
-    "NOM_EEG_ELEC_POTL_CRTXWaveExport.csv",
     "NOM_PLETHWaveExport.csv",
     "NOM_RESPWaveExport.csv",
     "MPrawoutput.txt",

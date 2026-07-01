@@ -1,0 +1,93 @@
+# vscc — open patient-monitor telemetry stack (research/education use only).
+#
+# Single-file install, no repo checkout needed:
+#   curl -O https://raw.githubusercontent.com/chsbusch-dot/vscc-mqtt-server/main/docker-compose.yml
+#   MONITOR_IP=192.168.1.215 docker compose up -d
+# Then open http://<this-host>/ in a browser.
+#
+# Runs anywhere Docker (Compose V2) runs: Linux, macOS, Windows/WSL2,
+# Raspberry Pi. Uses prebuilt images from ghcr.io/chsbusch-dot.
+# Developers: use vscc-docker-compose.yml in the repo to build from source.
+#
+# WARNING — patient data stays local: do not expose these ports beyond your
+# controlled network; captured telemetry may constitute PHI.
+
+name: vscc
+
+services:
+  emqx:
+    image: emqx/emqx:6.0.0
+    ports:
+      - "1883:1883"    # MQTT (TCP)
+      - "8083:8083"    # MQTT over WebSocket (path /mqtt) — used by the dashboard
+      - "18083:18083"  # EMQX admin UI (default admin/public — change it)
+    restart: unless-stopped
+
+  timescaledb:
+    image: timescale/timescaledb:2.19.3-pg14
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: telemetry
+    ports:
+      - "5432:5432"    # direct SQL access for research queries
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    # Schema is bootstrapped by the worker at startup — no init.sql needed.
+
+  capture:
+    image: ghcr.io/chsbusch-dot/vscc-capture:latest
+    environment:
+      MONITOR_IP: ${MONITOR_IP:?Set MONITOR_IP to the monitor IP, e.g. MONITOR_IP=192.168.1.215 docker compose up -d}
+      WAVESET: ${WAVESET:-12}
+      TZ: UTC   # capture stamps exports in this TZ; the worker (MONITOR_TZ) must match
+    volumes:
+      - vscc-data:/data
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+  worker:
+    image: ghcr.io/chsbusch-dot/vscc-worker:latest
+    depends_on:
+      - timescaledb
+      - emqx
+    environment:
+      DB_DSN: postgresql://postgres:${POSTGRES_PASSWORD:-password}@timescaledb:5432/telemetry
+      MQTT_BROKER: emqx
+      # The capture CONTAINER runs in UTC (TZ: UTC above), so its export
+      # timestamps are UTC and the worker must read them as UTC. Do NOT set this
+      # to a local zone — that double-counts the offset (stores hours in the
+      # future). Timestamps are stored UTC; the dashboard localizes per viewer.
+      MONITOR_TZ: UTC
+      VSC_DATA_DIR: /data
+    volumes:
+      - vscc-data:/data
+      # Session exports land OUTSIDE Docker as plain host files (./sessions next
+      # to this compose file) — easy to copy, back up, or delete.
+      - ./sessions:/sessions
+    ports:
+      - "8001:8000"    # historic data API
+    restart: unless-stopped
+
+  streamer:
+    image: ghcr.io/chsbusch-dot/vscc-streamer:latest
+    volumes:
+      - vscc-data:/data
+    ports:
+      - "8000:8000"    # raw JSON + websocket stream
+    restart: unless-stopped
+
+  dashboard:
+    image: ghcr.io/chsbusch-dot/vscc-dashboard:latest
+    environment:
+      # Optional: backend host the dashboard targets (default: the serving host).
+      # Only needed when the dashboard runs on a different machine than the backend.
+      VSCC_HOST: ${VSCC_HOST:-}
+    ports:
+      - "80:80"
+    restart: unless-stopped
+
+volumes:
+  vscc-data:
+  timescaledb-data:

@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS patient_numerics (
     value DOUBLE PRECISION NOT NULL
 );
 
--- 2. Create the table for high-frequency waveform data (e.g., PLETH, EEG)
+-- 2. Create the table for high-frequency waveform data (e.g., PLETH, ECG)
 CREATE TABLE IF NOT EXISTS patient_waveforms (
     time TIMESTAMPTZ NOT NULL,
     physio_id TEXT NOT NULL,

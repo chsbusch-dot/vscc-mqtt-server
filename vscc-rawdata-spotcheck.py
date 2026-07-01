@@ -283,7 +283,6 @@ KNOWN = [
     "NOM_ECG_ELEC_POTL_IIWaveExport.csv",
     "NOM_PLETHWaveExport.csv",
     "NOM_RESPWaveExport.csv",
-    "NOM_EEG_ELEC_POTL_CRTXWaveExport.csv",
     "DataExportVSC.json",
 ]
 

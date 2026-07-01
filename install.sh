@@ -48,7 +48,8 @@ if [ "$1" == "-u" ]; then
     if [ -f "$COMPOSE_FILE" ]; then
         echo "Stopping and removing Docker containers, networks, and all related images/volumes..."
         # The 'down' command with -v removes volumes and --rmi 'all' removes images
-        docker compose -f "$COMPOSE_FILE" down -v --rmi all
+        # --profile dashboard so the optional dashboard container is removed too
+        docker compose -f "$COMPOSE_FILE" --profile dashboard down -v --rmi all
     else
         echo "Docker compose file not found, skipping Docker cleanup."
     fi
@@ -98,21 +99,49 @@ if command -v apt-get &> /dev/null; then
     fi
 fi
 
-# Check for essential commands
-for cmd in docker wget unzip timeout mosquitto_sub; do
+# Check for essential commands; offer to install anything missing (Debian/Ubuntu)
+MISSING_PKGS=""
+command -v git   &> /dev/null || MISSING_PKGS="$MISSING_PKGS git"
+command -v wget  &> /dev/null || MISSING_PKGS="$MISSING_PKGS wget"
+command -v unzip &> /dev/null || MISSING_PKGS="$MISSING_PKGS unzip"
+if ! command -v docker &> /dev/null; then
+    MISSING_PKGS="$MISSING_PKGS docker.io docker-compose-v2"
+elif ! docker compose version &> /dev/null; then
+    MISSING_PKGS="$MISSING_PKGS docker-compose-v2"
+fi
+
+if [ -n "$MISSING_PKGS" ]; then
+    echo "The following required tools are missing:$MISSING_PKGS"
+    if ! command -v apt-get &> /dev/null; then
+        echo "Error: apt-get not found. Please install them manually and re-run."
+        exit 1
+    fi
+    read -p "Install them now via apt-get? [y/N] " INSTALL_DEPS
+    case "$INSTALL_DEPS" in
+        [Yy]*)
+            apt-get update && apt-get install -y $MISSING_PKGS
+            ;;
+        *)
+            echo "Aborting: install the missing tools and re-run ./install.sh."
+            exit 1
+            ;;
+    esac
+    # If Docker was just installed, make sure the daemon is enabled and running
+    if ! docker info &> /dev/null; then
+        systemctl enable --now docker 2>/dev/null || true
+    fi
+fi
+
+# Final verification after any installs
+for cmd in git docker wget unzip timeout mosquitto_sub; do
   if ! command -v $cmd &> /dev/null; then
-    echo "Error: Required command '$cmd' not found."
-    echo "On Debian/Ubuntu, you may be able to install it with:"
-    echo "sudo apt-get update && sudo apt-get install -y coreutils mosquitto-clients"
+    echo "Error: Required command '$cmd' still not found. Aborting."
     exit 1
   fi
 done
-
-# Check for Docker Compose V2 plugin
 if ! docker compose version &> /dev/null; then
-  echo "Error: 'docker compose' (V2) not found."
-  echo "Please ensure the Docker Compose V2 plugin is installed and accessible."
-  echo "It is included with modern versions of Docker Desktop."
+  echo "Error: 'docker compose' (V2) still not available. Aborting."
+  echo "On non-Ubuntu systems install the Compose plugin per https://docs.docker.com/compose/install/"
   exit 1
 fi
 
@@ -153,8 +182,10 @@ echo "VSCaptureCLI is ready."
 COMPOSE_FILE="vscc-docker-compose.yml"
 
 echo "Ensuring no old containers are running..."
-# The 'down' command with -v removes volumes, ensuring a clean slate.
-docker compose -f "$COMPOSE_FILE" down -v
+# Stop existing containers but PRESERVE volumes — re-running the installer to
+# pick up an update must NOT wipe the TimescaleDB volume (recorded sessions).
+# Use the uninstall path or `docker compose down -v` manually for a clean slate.
+docker compose -f "$COMPOSE_FILE" down --remove-orphans
 
 echo "Starting backend services with Docker Compose..."
 echo "This may take a few minutes on the first run to build the worker image..."
@@ -176,55 +207,17 @@ chmod +x update.sh
 echo "Installing VSCapture CLI service..."
 ./vscc-install-capture-cli.sh "$DEVICE_IP"
 
-# --- PATCH: Create a Keep-Alive Wrapper for VSCapture ---
+# --- PATCH: Install the Keep-Alive Wrapper for VSCapture ---
 # This prevents the service from entering a 'failed' state if the monitor is offline
-# or if the connection drops. It will simply retry indefinitely.
+# or if the connection drops, recycles silent hangs from stale monitor associations,
+# and stamps abrupt stops so the next start waits out the association timeout.
+# The wrapper itself lives in the repo as vscc-capture-loop.sh.
 
 WRAPPER_SCRIPT="$(pwd)/VSCapture/vscc-loop.sh"
 SERVICE_FILE="/etc/systemd/system/vscc-capture-cli.service"
 
-echo "Creating keep-alive wrapper at $WRAPPER_SCRIPT..."
-cat <<EOF > "$WRAPPER_SCRIPT"
-#!/bin/bash
-cd "\$(dirname "\$0")"
-# Use full path to dotnet if possible, otherwise assume in PATH
-DOTNET_CMD=\$(command -v dotnet || echo "/usr/bin/dotnet")
-
-echo "[Wrapper] Service started (PID \$\$)."
-
-# User-specified advanced capture command with WebSocket export
-# Note: Port 8083 is the default EMQX WebSocket listener. Path is /mqtt
-# Master Command: dotnet VSCaptureCLI.dll --devices 1 --device1type 1 --device1model 1 --device1arg "-mode 2 -port 192.168.1.215 -interval 3 -export 4 -devid mp50 -waveset 12 -scale 2"
-
-CMD="\$DOTNET_CMD VSCaptureCLI.dll --devices 1 --device1type 1 --device1model 1 --device1arg '-mode 2 -port $DEVICE_IP -interval 1 -export 4 -devid mp50  -waveset 12 -scale 2'"
-
-echo "[Wrapper] Configuration:"
-echo "  - Target Monitor: $DEVICE_IP"
-echo "  - MQTT URL: ws://127.0.0.1:8083/mqtt"
-echo "  - Full Command: \$CMD"
-
-while true; do
-    # 1. PING CHECK: Wait for the monitor to be physically reachable
-    # This prevents UDP timeout crashes and log spam when the monitor is off.
-    if ping -c 1 -W 2 "$DEVICE_IP" > /dev/null 2>&1; then
-        echo "[Wrapper] Monitor ($DEVICE_IP) is ONLINE. Launching capture process..."
-        
-        # VSCaptureCLI crashes if Console.KeyAvailable is checked without a TTY.
-        # We use 'script' to fake a PTY (Pseudo-Terminal).
-        # We pipe to awk. If a UDP timeout occurs, awk exits, breaking the pipe.
-        # This sends SIGPIPE to VSCapture, instantly bypassing the "Press Escape" hang!
-        script -q -c "\$CMD" /dev/null | awk '{print} /Connection timed out/{print "[Wrapper] UDP Timeout detected. Forcing restart..."; fflush(); exit}'
-        
-        echo "[Wrapper] Process exited. Restarting in 5s..."
-        sleep 5
-    else
-        echo "[Wrapper] Monitor ($DEVICE_IP) is OFFLINE. Ping failed. Waiting..."
-    fi
-    
-    # 15-second delay to prevent CPU spinning
-    sleep 10
-done
-EOF
+echo "Installing keep-alive wrapper at $WRAPPER_SCRIPT..."
+sed "s/@DEVICE_IP@/$DEVICE_IP/g" vscc-capture-loop.sh > "$WRAPPER_SCRIPT"
 chmod +x "$WRAPPER_SCRIPT"
 
 # Patch the systemd service to use the wrapper instead of direct dotnet call
@@ -232,15 +225,17 @@ if [ -f "$SERVICE_FILE" ]; then
     echo "Patching systemd service to use keep-alive wrapper..."
     # Fully replace the ExecStart line to ensure valid syntax and prevent trailing garbage
     sed -i "s|^ExecStart=.*|ExecStart=$WRAPPER_SCRIPT|" "$SERVICE_FILE"
-    
+
     # Remove the sleep delay to speed up startup (wrapper handles waiting now)
     echo "Optimizing service startup time..."
     sed -i "/^ExecStartPre/d" "$SERVICE_FILE"
-    
-    # Force systemd to kill the blocked process quickly instead of waiting 90 seconds
-    echo "Optimizing shutdown timeouts..."
-    sed -i "s/^KillSignal=.*/KillSignal=SIGKILL\nTimeoutStopSec=5/" "$SERVICE_FILE"
-    
+
+    # Graceful shutdown: TERM goes to the wrapper only (KillMode=mixed), which kills
+    # the capture and stamps the stop time; stragglers get SIGKILL after 20s.
+    echo "Configuring graceful shutdown..."
+    sed -i "/^TimeoutStopSec=/d;/^KillMode=/d" "$SERVICE_FILE"
+    sed -i "s/^KillSignal=.*/KillSignal=SIGTERM\nTimeoutStopSec=20\nKillMode=mixed/" "$SERVICE_FILE"
+
     systemctl daemon-reload
     systemctl restart vscc-capture-cli.service
 fi
@@ -256,22 +251,26 @@ APP_PATH=$(pwd)
 CLEANUP_SCRIPT_PATH="$APP_PATH/vscc-file-cleanup.py"
 UPDATE_SCRIPT_PATH="$APP_PATH/update.sh"
 
-# Job 1: File Cleanup (every hour)
+# Both jobs are written in ONE atomic crontab update (a fresh-install smoke test
+# caught the hourly job vanishing when two sequential read-modify-write cycles
+# were used), then verified.
 CLEANUP_JOB="0 * * * * /usr/bin/python3 $CLEANUP_SCRIPT_PATH"
-if ! (sudo -u "$CRON_USER" crontab -l 2>/dev/null | grep -Fq "$CLEANUP_SCRIPT_PATH"); then
-    (sudo -u "$CRON_USER" crontab -l 2>/dev/null; echo "$CLEANUP_JOB") | sudo -u "$CRON_USER" crontab -
-    echo "File cleanup cron job installed to run hourly."
-else
-    echo "File cleanup cron job already exists. Skipping."
-fi
-
-# Job 2: Auto-Update (every 3 months)
 UPDATE_JOB="0 0 1 */3 * $UPDATE_SCRIPT_PATH"
-if ! (sudo -u "$CRON_USER" crontab -l 2>/dev/null | grep -Fq "$UPDATE_SCRIPT_PATH"); then
-    (sudo -u "$CRON_USER" crontab -l 2>/dev/null; echo "$UPDATE_JOB") | sudo -u "$CRON_USER" crontab -
-    echo "Auto-update cron job installed to run quarterly."
+{
+    # '|| true': under set -e this read pipeline exits 1 on a fresh box (no
+    # crontab yet / grep selects nothing), which would kill the subshell BEFORE
+    # the echos run and install an empty crontab. Root cause of the smoke-test
+    # cron-loss bug.
+    sudo -u "$CRON_USER" crontab -l 2>/dev/null | grep -vF "$CLEANUP_SCRIPT_PATH" | grep -vF "$UPDATE_SCRIPT_PATH" || true
+    echo "$CLEANUP_JOB"
+    echo "$UPDATE_JOB"
+} | sudo -u "$CRON_USER" crontab -
+
+if sudo -u "$CRON_USER" crontab -l 2>/dev/null | grep -Fq "$CLEANUP_SCRIPT_PATH" \
+   && sudo -u "$CRON_USER" crontab -l 2>/dev/null | grep -Fq "$UPDATE_SCRIPT_PATH"; then
+    echo "Cron jobs installed: hourly file cleanup + quarterly update."
 else
-    echo "Auto-update cron job already exists. Skipping."
+    echo "WARNING: cron job verification failed — check 'crontab -l' as $CRON_USER."
 fi
 
 
@@ -290,7 +289,7 @@ systemctl status vscc-websocket-streamer.service --no-pager
 echo ""
 echo "Verifying MQTT message reception from MP50..."
 echo "(Listening for 5 seconds...)"
-if timeout 5 mosquitto_sub -h 127.0.0.1 -t telemetry/mp50 -C 1 -v; then
+if timeout 8 mosquitto_sub -h 127.0.0.1 -t 'mp50/#' -C 1 -v; then
     echo "MQTT verification successful. Messages are being received."
 else
     echo "Warning: No MQTT messages were received in the 5-second window."
