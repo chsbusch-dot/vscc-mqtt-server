@@ -1,5 +1,10 @@
-# Dev/test dependencies (not needed at runtime). See tests/test_api.py.
+# Dev/test dependencies (not needed at runtime).
 #   pip install -r requirements-dev.txt
+# Unit tests (tests/test_worker.py) run standalone.
+# API smoke tests (tests/test_api.py) need a running worker; they skip otherwise:
 #   VSCC_TEST_BASE=http://localhost:8001 pytest tests/ -q
+-r requirements.txt
 pytest>=8.0
+ruff
+mypy
 httpx>=0.27

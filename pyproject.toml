@@ -1,0 +1,48 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# Start conservative so CI is green on day one; tighten over time.
+# E/F = pyflakes + pycodestyle errors, I = import sorting, B = bugbear.
+# UP (pyupgrade) is intentionally left off the day-one baseline; enable it
+# during the legacy-cleanup ticket once the old scripts are modernized.
+select = ["E", "F", "I", "B"]
+# The worker uses terse one-line try/except idioms; don't fight them yet.
+ignore = ["E701", "E702"]
+
+[tool.ruff.lint.per-file-ignores]
+# Pre-existing scripts predate this pipeline. Rather than reformat working
+# production code in the same commit that adds CI, we grandfather their debt
+# and pay it down under its own tracked ticket (Linear WOR: worker lint debt).
+# NEW code (tests/, future modules) is held to the full rule set above.
+"vscc_mqtt_timescale_worker.py" = ["E501", "F401", "F541", "I001", "B007", "B905", "E731"]
+"vscc-rawdata-spotcheck.py" = ["E501", "F401", "F541", "I001", "B007"]
+"vscc-rawdata-format-probe.py" = ["E501", "F401", "F541", "I001", "B007"]
+"vscc-websocket-streamer.py" = ["E501", "F401", "F541", "I001", "B007"]
+"vscc-file-cleanup.py" = ["E501", "F401", "F541", "I001", "B007"]
+
+[tool.mypy]
+python_version = "3.11"
+# Non-strict on day one: type the new code well, don't block on untyped deps.
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+# Follow imports but don't fail on the grandfathered modules (see below).
+follow_imports = "silent"
+
+[[tool.mypy.overrides]]
+# Legacy modules carry pre-pipeline type debt; tracked in Linear (WOR), not
+# blocking. New code (tests/, future modules) is checked normally.
+module = [
+    "vscc_mqtt_timescale_worker",
+    "vscc-websocket-streamer",
+    "vscc-rawdata-spotcheck",
+    "vscc-rawdata-format-probe",
+    "vscc-file-cleanup",
+]
+ignore_errors = true

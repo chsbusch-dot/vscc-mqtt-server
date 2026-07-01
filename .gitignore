@@ -13,6 +13,13 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Test / lint tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
 # macOS
 .DS_Store
 **/.DS_Store
