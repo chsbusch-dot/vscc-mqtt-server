@@ -2,22 +2,26 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import tempfile
 from array import array
-from pathlib import Path
 from contextlib import asynccontextmanager
-import shutil
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
-from typing import Union, List, Dict, Any, Optional
-from fastapi import FastAPI, Response
-from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
+
 import aiofiles
-import asyncpg
 import aiomqtt
+import asyncpg
+from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from prometheus_client import (
-    CollectorRegistry, Gauge, generate_latest, CONTENT_TYPE_LATEST,
+    CONTENT_TYPE_LATEST,
+    CollectorRegistry,
+    Gauge,
+    generate_latest,
 )
 
 # --- Configuration ---
@@ -72,7 +76,7 @@ def wave_topic(physio_id: str) -> str:
     return f"mp50/{short}"
 
 
-def wave_config(path: Path) -> Dict[str, Any]:
+def wave_config(path: Path) -> dict[str, Any]:
     physio_id = physio_id_from_wave_file(path)
     return {"path": path, "type": "csv", "topic": wave_topic(physio_id),
             "physio_id": physio_id}
@@ -89,7 +93,7 @@ last_data_time = None
 WORKER_START = None                                    # set in lifespan
 inserted_totals = {"patient_numerics": 0, "patient_waveforms": 0}
 # Per-source (DeviceID) integrity: clock offset, sequence tracking, liveness.
-source_state: Dict[str, Dict[str, Any]] = {}
+source_state: dict[str, dict[str, Any]] = {}
 # Capture liveness thresholds (waveforms keep last_data_time sub-second fresh
 # while capturing, so these detect a stalled/stopped capture regardless of the
 # numerics interval).
@@ -106,7 +110,7 @@ def _capture_state(now: datetime):
         return "stalled", age
     return "offline", age
 
-def _track_source_integrity(record: Dict[str, Any]):
+def _track_source_integrity(record: dict[str, Any]):
     """Per-source data-integrity signals, derived purely from the export record:
     - clock offset = host wall-clock stamp (SystemLocalTime) minus monitor
       device stamp (Timestamp): timestamp uncertainty between source and capture.
@@ -117,7 +121,7 @@ def _track_source_integrity(record: Dict[str, Any]):
         "clock_offset_s": None, "sequence_regressions": 0,
         "last_relativetimestamp": None, "last_seen": None, "samples": 0})
     st["samples"] += 1
-    st["last_seen"] = datetime.now(timezone.utc)
+    st["last_seen"] = datetime.now(UTC)
     mono = parse_vsc_timestamp(record.get("Timestamp"))
     host = parse_vsc_timestamp(record.get("SystemLocalTime"))
     if mono and host:
@@ -154,11 +158,11 @@ def _default_session_label(now_utc: datetime) -> str:
     """Default 'Session <local date/time>' label, localized to SESSION_LABEL_TZ."""
     return f"Session {now_utc.astimezone(SESSION_LABEL_TZ).strftime('%Y-%m-%d %H:%M')}"
 
-def parse_vsc_timestamp(raw_time: str) -> Union[datetime, None]:
+def parse_vsc_timestamp(raw_time: str) -> datetime | None:
     if not raw_time: return None
-    try: return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S.%f").replace(tzinfo=MONITOR_TZ).astimezone(timezone.utc)
+    try: return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S.%f").replace(tzinfo=MONITOR_TZ).astimezone(UTC)
     except ValueError:
-        try: return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S").replace(tzinfo=MONITOR_TZ).astimezone(timezone.utc)
+        try: return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S").replace(tzinfo=MONITOR_TZ).astimezone(UTC)
         except ValueError: return None
 
 # --- 1. The Database Batch Worker ---
@@ -191,7 +195,7 @@ async def batch_inserter():
             print(f"Database batch insert error: {e}")
 
 # --- 2. The Generic Async File Tailer ---
-async def tail_file(config: Dict[str, Any], client: aiomqtt.Client):
+async def tail_file(config: dict[str, Any], client: aiomqtt.Client):
     file_path, file_type, topic = config["path"], config["type"], config["topic"]
     print(f"Waiting for file: {file_path}...")
     while not file_path.exists() or not file_path.is_file(): await asyncio.sleep(1)
@@ -206,7 +210,7 @@ async def tail_file(config: Dict[str, Any], client: aiomqtt.Client):
             continue
 
         try:
-            async with aiofiles.open(file_path, mode="r", encoding="utf-8", errors="ignore") as f:
+            async with aiofiles.open(file_path, encoding="utf-8", errors="ignore") as f:
                 await f.seek(0, os.SEEK_END)
                 last_size = os.path.getsize(file_path)
                 last_ino = os.stat(file_path).st_ino
@@ -226,7 +230,7 @@ async def tail_file(config: Dict[str, Any], client: aiomqtt.Client):
                         if current_time - last_read_monotonic > WAVEFORM_DISCONNECT_TIMEOUT:
                             if file_type == "csv" and not disconnected_sent:
                                 print(f"Timeout on {file_path.name}. Sending disconnect signal to {topic}.")
-                                null_payload = json.dumps({"value": None, "physio_id": config["physio_id"], "time": datetime.now(timezone.utc).timestamp()})
+                                null_payload = json.dumps({"value": None, "physio_id": config["physio_id"], "time": datetime.now(UTC).timestamp()})
                                 await client.publish(topic, payload=null_payload, qos=0)
                                 disconnected_sent = True
                         
@@ -382,7 +386,7 @@ async def ensure_schema(pool):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool, WORKER_START
-    WORKER_START = datetime.now(timezone.utc)
+    WORKER_START = datetime.now(UTC)
     while True:
         try:
             db_pool = await asyncpg.create_pool(DB_DSN)
@@ -473,7 +477,7 @@ async def get_historic_data(range_minutes: int):
 
 # --- 4. Settings ---
 
-async def get_settings() -> Dict[str, str]:
+async def get_settings() -> dict[str, str]:
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT key, value FROM vscc_settings")
     settings = dict(DEFAULT_SETTINGS)
@@ -502,7 +506,7 @@ async def read_settings():
             "sessions_dir": str(SESSIONS_DIR), "parquet_available": _parquet_available()}
 
 @app.put("/api/settings")
-async def write_settings(payload: Dict[str, Any]):
+async def write_settings(payload: dict[str, Any]):
     allowed = {k: str(v) for k, v in payload.items() if k in DEFAULT_SETTINGS}
     # Validate numeric settings BEFORE persisting — a non-numeric value would
     # otherwise be stored and then break the session manager / retention loop on
@@ -551,7 +555,7 @@ CAPTURE_DEFAULTS = {
 }
 _IP_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
 
-def _validate_capture(key: str, value: str) -> Optional[str]:
+def _validate_capture(key: str, value: str) -> str | None:
     """Returns an error message, or None when the value is acceptable."""
     if key == "monitor_ip":
         if value == "":
@@ -568,11 +572,11 @@ def _validate_capture(key: str, value: str) -> Optional[str]:
         return None if re.match(r"^[A-Za-z0-9_-]{1,32}$", value) else "devid must be 1-32 chars of [A-Za-z0-9_-]"
     return "unknown key"
 
-async def _capture_settings() -> Dict[str, str]:
+async def _capture_settings() -> dict[str, str]:
     stored = await get_settings()
     return {k: stored.get(f"capture_{k}", v) for k, v in CAPTURE_DEFAULTS.items()}
 
-def _write_capture_config_file(cfg: Dict[str, str]):
+def _write_capture_config_file(cfg: dict[str, str]):
     """Atomic write (tmp + rename) so the capture's watcher never sees a torn file."""
     content = "".join(f"{k}={v}\n" for k, v in cfg.items() if v != "")
     CAPTURE_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -586,7 +590,7 @@ async def read_capture_config():
     return {**cfg, "config_file": str(CAPTURE_CONFIG_FILE)}
 
 @app.put("/api/capture-config")
-async def write_capture_config(payload: Dict[str, Any]):
+async def write_capture_config(payload: dict[str, Any]):
     updates = {k: str(payload[k]).strip() for k in CAPTURE_DEFAULTS if k in payload}
     if not updates:
         return {"ok": False, "error": "nothing to update"}
@@ -609,7 +613,7 @@ async def write_capture_config(payload: Dict[str, Any]):
 # --- 4c. Observability: status, Prometheus metrics, integrity report ---
 
 METRICS = CollectorRegistry()
-_G = lambda name, doc, labels=None: Gauge(name, doc, labels or [], registry=METRICS)
+def _G(name, doc, labels=None): return Gauge(name, doc, labels or [], registry=METRICS)
 M_last_age   = _G("vscc_last_data_age_seconds", "Seconds since the newest data point ingested")
 M_db_lag     = _G("vscc_db_lag_seconds", "Seconds between now and the newest row in patient_numerics")
 M_db_size    = _G("vscc_db_size_bytes", "TimescaleDB 'telemetry' database size")
@@ -621,7 +625,7 @@ M_offset     = _G("vscc_source_clock_offset_seconds", "Host stamp minus monitor 
 M_seq        = _G("vscc_source_sequence_regressions_total", "Monitor Relativetimestamp regressions, per source", ["device"])
 
 async def _refresh_metrics():
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     state, age = _capture_state(now)
     M_last_age.set(age if age is not None else -1)
     M_capture_up.set(1 if state == "live" else 0)
@@ -650,7 +654,7 @@ async def metrics():
     await _refresh_metrics()
     return Response(generate_latest(METRICS), media_type=CONTENT_TYPE_LATEST)
 
-def _sources_view(now: datetime) -> Dict[str, Any]:
+def _sources_view(now: datetime) -> dict[str, Any]:
     return {dev: {
         "clock_offset_seconds": s["clock_offset_s"],
         "sequence_regressions": s["sequence_regressions"],
@@ -662,7 +666,7 @@ def _sources_view(now: datetime) -> Dict[str, Any]:
 async def status():
     """Health snapshot for dashboards/monitoring: capture state, last-data age,
     DB lag, buffer backlog, per-source integrity."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     state, age = _capture_state(now)
     db_lag = db_size = None
     try:
@@ -690,7 +694,7 @@ async def integrity_report():
     minus monitor Timestamp — timestamp uncertainty between source and capture)
     and sequence regressions (monitor counter going backwards = capture restart).
     Per-session data-loss statistics live under /api/sessions/{id}/quality."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return {
         "generated_at": now.isoformat(),
         "clock_offset_note": "host SystemLocalTime minus monitor Timestamp, seconds",
@@ -707,7 +711,7 @@ async def session_manager():
         try:
             settings = await get_settings()
             gap = timedelta(minutes=float(settings["session_gap_minutes"]))
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             async with db_pool.acquire() as conn:
                 open_row = await conn.fetchrow("SELECT id, started_at FROM sessions WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1")
                 if last_data_time is None:
@@ -735,14 +739,14 @@ async def gap_watchdog():
     prev = "init"
     while True:
         await asyncio.sleep(10)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         state, age = _capture_state(now)
         if state != prev:
             detail = f" (no data for {age:.0f}s)" if age is not None else ""
             print(f"[Watchdog] capture {prev} -> {state}{detail}")
             prev = state
 
-def _session_dict(r) -> Dict[str, Any]:
+def _session_dict(r) -> dict[str, Any]:
     return {"id": r["id"], "label": r["label"], "subject_code": r["subject_code"],
             "notes": r["notes"], "started_at": r["started_at"].timestamp(),
             "ended_at": r["ended_at"].timestamp() if r["ended_at"] else None,
@@ -755,7 +759,7 @@ async def list_sessions():
     return [_session_dict(r) for r in rows]
 
 @app.patch("/api/sessions/{session_id}")
-async def update_session(session_id: int, payload: Dict[str, Any]):
+async def update_session(session_id: int, payload: dict[str, Any]):
     fields = {k: str(payload[k]) for k in ("label", "subject_code", "notes") if k in payload}
     if not fields:
         return {"ok": False, "error": "nothing to update"}
@@ -784,7 +788,7 @@ async def delete_session(session_id: int, purge_data: bool = True):
 
 @app.get("/api/sessions/{session_id}/data")
 async def session_data(session_id: int, agg: str = "auto", max_raw_minutes: int = 15,
-                       from_ts: Optional[float] = None, to_ts: Optional[float] = None):
+                       from_ts: float | None = None, to_ts: float | None = None):
     """Session data for chart replay. `agg` selects the resolution:
       raw   — every sample
       1min  — 1-minute averages (waveforms from the continuous aggregate)
@@ -805,12 +809,12 @@ async def session_data(session_id: int, agg: str = "auto", max_raw_minutes: int 
         if not r:
             return {"error": "not found"}
         sess_start = r["started_at"]
-        sess_end = r["ended_at"] or datetime.now(timezone.utc)
+        sess_end = r["ended_at"] or datetime.now(UTC)
         # Optional [from_ts, to_ts] window, clamped to the session range. Lets the
         # client load only the visible span + margin of a long recording.
         try:
-            win_start = sess_start if from_ts is None else max(sess_start, datetime.fromtimestamp(float(from_ts), timezone.utc))
-            win_end = sess_end if to_ts is None else min(sess_end, datetime.fromtimestamp(float(to_ts), timezone.utc))
+            win_start = sess_start if from_ts is None else max(sess_start, datetime.fromtimestamp(float(from_ts), UTC))
+            win_end = sess_end if to_ts is None else min(sess_end, datetime.fromtimestamp(float(to_ts), UTC))
         except (ValueError, TypeError, OverflowError, OSError):
             return {"error": "from_ts/to_ts must be epoch seconds"}
         if win_end < win_start:
@@ -852,7 +856,7 @@ async def session_data(session_id: int, agg: str = "auto", max_raw_minutes: int 
             waveforms = await conn.fetch(
                 "SELECT time, physio_id, value FROM patient_waveforms WHERE time BETWEEN $1 AND $2 ORDER BY time, ctid",
                 win_start, win_end)
-    fmt = lambda rows: [{"time": x["time"].timestamp(), "physio_id": x["physio_id"], "value": float(x["value"])} for x in rows]
+    def fmt(rows): return [{"time": x["time"].timestamp(), "physio_id": x["physio_id"], "value": float(x["value"])} for x in rows]
     # Build the (potentially large) row lists off the event loop so a raw replay
     # doesn't block telemetry ingest and other requests during serialization.
     num_out, wave_out = await asyncio.gather(
@@ -877,7 +881,7 @@ def _session_package_dir(r, deidentify: bool = False) -> Path:
     return SESSIONS_DIR / f"{r['started_at'].strftime('%Y%m%d-%H%M')}_{r['id']}_{slug}"
 
 async def _export_session_files(session_id: int, deidentify: bool = False,
-                                base_dir: Optional[Path] = None) -> Dict[str, Any]:
+                                base_dir: Path | None = None) -> dict[str, Any]:
     """Write session.json + numerics/waveforms CSV (and Parquet when pyarrow is
     present). Rows are streamed from the DB with a cursor in fixed-size batches,
     so multi-GB sessions export with flat memory. base_dir overrides SESSIONS_DIR
@@ -895,10 +899,10 @@ async def _export_session_files(session_id: int, deidentify: bool = False,
         r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
         if not r:
             return {"ok": False, "error": "not found"}
-        end = r["ended_at"] or datetime.now(timezone.utc)
+        end = r["ended_at"] or datetime.now(UTC)
         t0 = r["started_at"]
         time_col = "time_rel_s" if deidentify else "time_utc"
-        rel = lambda t: round((t - t0).total_seconds(), 6)
+        def rel(t): return round((t - t0).total_seconds(), 6)
 
         out = _session_package_dir(r, deidentify)
         if base_dir is not None:
@@ -977,7 +981,7 @@ async def _export_session_files(session_id: int, deidentify: bool = False,
     else:
         meta = {**_session_dict(r), "time_format": "ISO 8601 UTC"}
     with open(out / "session.json", "w") as f:
-        json.dump({**meta, "exported_at": datetime.now(timezone.utc).isoformat(),
+        json.dump({**meta, "exported_at": datetime.now(UTC).isoformat(),
                    "partial": partial, "retained_from_s": retained_from_s,
                    "numeric_rows": counts["numerics"], "waveform_rows": counts["waveforms"],
                    "quality": quality}, f, indent=2)
@@ -998,8 +1002,9 @@ async def download_session(session_id: int, deidentify: bool = False):
     result = await _export_session_files(session_id, deidentify)
     if not result.get("ok"):
         return result
-    from zipstream import ZipStream  # zipstream-ng
     import zipfile as _zf
+
+    from zipstream import ZipStream  # zipstream-ng
     out = Path(result["path"])
     zs = ZipStream.from_path(out, compress_type=_zf.ZIP_DEFLATED, compress_level=1)
     return StreamingResponse(iter(zs), media_type="application/zip",
@@ -1019,7 +1024,7 @@ async def download_all_sessions(deidentify: bool = False):
     tmp = Path(tempfile.mkdtemp(dir=str(SESSIONS_DIR), prefix="download-all-"))
     try:
         for r in rows:
-            end = r["ended_at"] or datetime.now(timezone.utc)
+            end = r["ended_at"] or datetime.now(UTC)
             async with db_pool.acquire() as conn:
                 has_data = await conn.fetchval(
                     "SELECT EXISTS (SELECT 1 FROM patient_numerics WHERE time BETWEEN $1 AND $2 LIMIT 1)"
@@ -1027,12 +1032,13 @@ async def download_all_sessions(deidentify: bool = False):
                     r["started_at"], end)
             if has_data:
                 await _export_session_files(r["id"], deidentify, base_dir=tmp)
-        from zipstream import ZipStream  # zipstream-ng
         import zipfile as _zf
+
+        from zipstream import ZipStream  # zipstream-ng
         zs = ZipStream(compress_type=_zf.ZIP_DEFLATED, compress_level=1)
         for child in sorted(tmp.iterdir()):
             zs.add_path(child, arcname=child.name)  # session folders at the zip root, no temp-dir prefix
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M")
         suffix = "-deid" if deidentify else ""
 
         def stream_then_cleanup():
@@ -1048,12 +1054,12 @@ async def download_all_sessions(deidentify: bool = False):
         raise
 
 @app.post("/api/sessions")
-async def create_session(payload: Optional[Dict[str, Any]] = None):
+async def create_session(payload: dict[str, Any] | None = None):
     """Manual named 'Start session': closes any open session at the boundary and
     starts recording into a fresh one with optional metadata (label, subject_code,
     notes). Incoming data keeps flowing; only the session metadata boundary moves."""
     payload = payload or {}
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     label = payload.get("label") or _default_session_label(now)
     subject = str(payload.get("subject_code", ""))
     notes = str(payload.get("notes", ""))
@@ -1068,7 +1074,7 @@ async def create_session(payload: Optional[Dict[str, Any]] = None):
 async def stop_session(session_id: int):
     """Explicit 'Stop recording': closes an open session now. Pairs with the
     named start above; auto-close on data silence still applies as a fallback."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     async with db_pool.acquire() as conn:
         r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
         if not r:
@@ -1087,7 +1093,7 @@ async def session_signals(session_id: int):
         r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
         if not r:
             return {"error": "not found"}
-        end = r["ended_at"] or datetime.now(timezone.utc)
+        end = r["ended_at"] or datetime.now(UTC)
         nums = await conn.fetch(
             "SELECT DISTINCT physio_id FROM patient_numerics WHERE time BETWEEN $1 AND $2 ORDER BY 1",
             r["started_at"], end)
@@ -1131,7 +1137,7 @@ SELECT physio_id,
 FROM g GROUP BY physio_id ORDER BY physio_id
 """
 
-async def _compute_quality(conn, started_at, end) -> Dict[str, Any]:
+async def _compute_quality(conn, started_at, end) -> dict[str, Any]:
     waves = []
     for r in await conn.fetch(QUALITY_WAVE_SQL, started_at, end):
         span_s = int((r["last_sec"] - r["first_sec"]).total_seconds()) + 1
@@ -1164,7 +1170,7 @@ async def session_quality(session_id: int):
         r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
         if not r:
             return {"error": "not found"}
-        end = r["ended_at"] or datetime.now(timezone.utc)
+        end = r["ended_at"] or datetime.now(UTC)
         quality = await _compute_quality(conn, r["started_at"], end)
     return {"session": _session_dict(r), **quality}
 
@@ -1192,22 +1198,22 @@ def _edf_num(value: float, width: int) -> bytes:
         s = fmt % value
         if len(s) <= width:
             return s.ljust(width).encode("ascii")
-    return ("%.1e" % value)[:width].ljust(width).encode("ascii")
+    return f"{value:.1e}"[:width].ljust(width).encode("ascii")
 
-def _edf_flush_second(f, sec_idx: Optional[int], n_records: int, spr: int, buf: List[int]):
+def _edf_flush_second(f, sec_idx: int | None, n_records: int, spr: int, buf: list[int]):
     if sec_idx is None or not (0 <= sec_idx < n_records):
         return
     vals = (buf + [0] * spr)[:spr]  # pad short seconds, trim overfull ones
     f.seek(sec_idx * spr * 2)
     f.write(array("h", vals).tobytes())
 
-async def _export_session_edf(session_id: int) -> Dict[str, Any]:
+async def _export_session_edf(session_id: int) -> dict[str, Any]:
     """Build <package>/waveforms.edf, regenerated fresh on every call."""
     async with db_pool.acquire() as conn:
         r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
         if not r:
             return {"ok": False, "error": "not found"}
-        end = r["ended_at"] or datetime.now(timezone.utc)
+        end = r["ended_at"] or datetime.now(UTC)
 
         chans = []
         for q in await conn.fetch(QUALITY_WAVE_SQL, r["started_at"], end):
@@ -1269,19 +1275,19 @@ async def _export_session_edf(session_id: int) -> Dict[str, Any]:
                 for c in chans:
                     pid = c["physio_id"]
                     o.write(_edf_ascii(pid[4:] if pid.startswith("NOM_") else pid, 16))
-                for c in chans: o.write(_edf_ascii("", 80))                       # transducer
-                for c in chans: o.write(_edf_ascii("", 8))                        # physical dimension (monitor units)
+                for _c in chans: o.write(_edf_ascii("", 80))                       # transducer
+                for _c in chans: o.write(_edf_ascii("", 8))                        # physical dimension (monitor units)
                 for c in chans: o.write(_edf_num(-c["pabs"], 8))
                 for c in chans: o.write(_edf_num(c["pabs"], 8))
-                for c in chans: o.write(_edf_ascii(-EDF_DIG_MAX, 8))
-                for c in chans: o.write(_edf_ascii(EDF_DIG_MAX, 8))
-                for c in chans: o.write(_edf_ascii("", 80))                       # prefiltering
+                for _c in chans: o.write(_edf_ascii(-EDF_DIG_MAX, 8))
+                for _c in chans: o.write(_edf_ascii(EDF_DIG_MAX, 8))
+                for _c in chans: o.write(_edf_ascii("", 80))                       # prefiltering
                 for c in chans: o.write(_edf_ascii(c["spr"], 8))
-                for c in chans: o.write(_edf_ascii("", 32))                       # reserved
+                for _c in chans: o.write(_edf_ascii("", 32))                       # reserved
                 handles = [open(c["tmp"], "rb") for c in chans]
                 try:
                     for _ in range(n_records):
-                        for h, c in zip(handles, chans):
+                        for h, c in zip(handles, chans, strict=True):
                             o.write(h.read(c["spr"] * 2))
                 finally:
                     for h in handles:
@@ -1312,12 +1318,12 @@ async def download_session_edf(session_id: int):
 
 # --- 9. Annotations: timestamped event markers ---
 
-def _annotation_dict(r) -> Dict[str, Any]:
+def _annotation_dict(r) -> dict[str, Any]:
     return {"id": r["id"], "time": r["time"].timestamp(), "label": r["label"],
             "session_id": r["session_id"]}
 
 @app.post("/api/annotations")
-async def create_annotation(payload: Dict[str, Any]):
+async def create_annotation(payload: dict[str, Any]):
     """Add an event marker. `time` is epoch seconds (default: now). Optionally
     tie it to a session_id (deleted with the session)."""
     label = str(payload.get("label", "")).strip()
@@ -1327,7 +1333,7 @@ async def create_annotation(payload: Dict[str, Any]):
     # {ok:false} instead of surfacing as an unhandled 500.
     ts = payload.get("time")
     try:
-        when = datetime.fromtimestamp(float(ts), timezone.utc) if ts is not None else datetime.now(timezone.utc)
+        when = datetime.fromtimestamp(float(ts), UTC) if ts is not None else datetime.now(UTC)
     except (ValueError, TypeError, OverflowError, OSError):
         return {"ok": False, "error": "time must be epoch seconds"}
     session_id = payload.get("session_id")
@@ -1345,17 +1351,17 @@ async def create_annotation(payload: Dict[str, Any]):
     return _annotation_dict(r)
 
 @app.get("/api/annotations")
-async def list_annotations(session_id: Optional[int] = None,
-                           from_ts: Optional[float] = None, to_ts: Optional[float] = None):
+async def list_annotations(session_id: int | None = None,
+                           from_ts: float | None = None, to_ts: float | None = None):
     """List event markers, newest first. Filter by session_id or a time window
     (from_ts/to_ts, epoch seconds)."""
     clauses, args = [], []
     if session_id is not None:
         args.append(session_id); clauses.append(f"session_id = ${len(args)}")
     if from_ts is not None:
-        args.append(datetime.fromtimestamp(from_ts, timezone.utc)); clauses.append(f"time >= ${len(args)}")
+        args.append(datetime.fromtimestamp(from_ts, UTC)); clauses.append(f"time >= ${len(args)}")
     if to_ts is not None:
-        args.append(datetime.fromtimestamp(to_ts, timezone.utc)); clauses.append(f"time <= ${len(args)}")
+        args.append(datetime.fromtimestamp(to_ts, UTC)); clauses.append(f"time <= ${len(args)}")
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(f"SELECT * FROM annotations{where} ORDER BY time DESC LIMIT 500", *args)

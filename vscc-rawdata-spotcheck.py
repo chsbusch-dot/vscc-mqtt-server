@@ -137,7 +137,7 @@ def report_csv(path, n_windows, win_lines, flat_eps):
     print(f"{'offset%':>7} {'n':>5} {'min':>9} {'max':>9} {'mean':>9} "
           f"{'std':>9} {'p2p':>9} {'uniq':>5} {'rough':>6} {'osc':>5}  verdict")
     labels = []
-    for off, raw_lines, missing, s in results:
+    for off, _raw_lines, _missing, s in results:
         pct = 100.0 * off / size if size else 0
         if s is None:
             print(f"{pct:6.1f}% {0:5d} {'-':>9} {'-':>9} {'-':>9} {'-':>9} "
@@ -166,8 +166,8 @@ def report_csv(path, n_windows, win_lines, flat_eps):
     else:
         verdict = "MIXED — partial signal, review windows above"
     print(f"  >>> {verdict}")
-    print(f"  (note: fast sampler can miss sparse/intermittent signal; "
-          f"re-run with --profile to be certain)")
+    print("  (note: fast sampler can miss sparse/intermittent signal; "
+          "re-run with --profile to be certain)")
     return verdict
 
 # ----- streaming flatness profile (definitive; one pass, constant memory) --
@@ -200,7 +200,7 @@ def profile_csv(path, seg_lines):
         print(f"{seg:7d} {f'{lo:,}-{hi:,}':>20} {d:8d} "
               f"{mn:10.4g} {mx:10.4g}  {'<-- LIVE' if live else ''}")
 
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
             n += 1
             v = parse_value_csv(line)
@@ -226,9 +226,9 @@ def profile_csv(path, seg_lines):
     print(f"\n  total samples: {n:,}   distinct values (whole file): "
           f"{td if td < 100000 else '100000+'}")
     if live_segments == 0 and td <= 3:
-        print(f"  >>> FLATLINE / DEAD TRACE — file is essentially constant")
+        print("  >>> FLATLINE / DEAD TRACE — file is essentially constant")
     elif live_segments == 0:
-        print(f"  >>> NEAR-FLAT — only a few quantization levels, no real waveform")
+        print("  >>> NEAR-FLAT — only a few quantization levels, no real waveform")
     else:
         print(f"  >>> HAS REAL DATA — {live_segments} live segment(s); "
               f"see rows marked LIVE above")

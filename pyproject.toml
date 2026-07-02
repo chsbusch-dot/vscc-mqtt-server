@@ -7,24 +7,16 @@ line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
-# Start conservative so CI is green on day one; tighten over time.
-# E/F = pyflakes + pycodestyle errors, I = import sorting, B = bugbear.
-# UP (pyupgrade) is intentionally left off the day-one baseline; enable it
-# during the legacy-cleanup ticket once the old scripts are modernized.
-select = ["E", "F", "I", "B"]
-# The worker uses terse one-line try/except idioms; don't fight them yet.
-ignore = ["E701", "E702"]
-
-[tool.ruff.lint.per-file-ignores]
-# Pre-existing scripts predate this pipeline. Rather than reformat working
-# production code in the same commit that adds CI, we grandfather their debt
-# and pay it down under its own tracked ticket (Linear WOR: worker lint debt).
-# NEW code (tests/, future modules) is held to the full rule set above.
-"vscc_mqtt_timescale_worker.py" = ["E501", "F401", "F541", "I001", "B007", "B905", "E731"]
-"vscc-rawdata-spotcheck.py" = ["E501", "F401", "F541", "I001", "B007"]
-"vscc-rawdata-format-probe.py" = ["E501", "F401", "F541", "I001", "B007"]
-"vscc-websocket-streamer.py" = ["E501", "F401", "F541", "I001", "B007"]
-"vscc-file-cleanup.py" = ["E501", "F401", "F541", "I001", "B007"]
+# E/F = pyflakes + pycodestyle errors, I = import sorting, B = bugbear,
+# UP = pyupgrade. The legacy files were modernized (WOR-6), so no per-file
+# grandfathering remains — everything is held to this set.
+select = ["E", "F", "I", "B", "UP"]
+# The worker deliberately uses terse one-line idioms (`if x: continue`), so the
+# one-statement-per-colon/semicolon rules stay off. E501 (line length) is also
+# relaxed repo-wide: the worker has long f-string HTML/JSON payloads where
+# reflowing hurts readability more than it helps. All other E/F/I/B/UP rules
+# apply everywhere — there is no per-file grandfathering anymore.
+ignore = ["E701", "E702", "E501"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -32,17 +24,5 @@ python_version = "3.11"
 ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true
-# Follow imports but don't fail on the grandfathered modules (see below).
+# Follow imports (the worker is now type-clean, so no per-module override).
 follow_imports = "silent"
-
-[[tool.mypy.overrides]]
-# Legacy modules carry pre-pipeline type debt; tracked in Linear (WOR), not
-# blocking. New code (tests/, future modules) is checked normally.
-module = [
-    "vscc_mqtt_timescale_worker",
-    "vscc-websocket-streamer",
-    "vscc-rawdata-spotcheck",
-    "vscc-rawdata-format-probe",
-    "vscc-file-cleanup",
-]
-ignore_errors = true
