@@ -124,7 +124,7 @@ def describe_mpraw(path):
     buckets = collections.Counter()
     nframes = 0
     total_bytes = 0
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.rstrip("\r\n")
             if not line:
