@@ -1,6 +1,10 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# Coverage gate: measures the worker module (what the unit tests exercise) and
+# fails if it drops below the floor. The floor is intentionally just under the
+# current level and should be ratcheted up as async-path tests land (WOR-7).
+# test_api.py skips without a live worker, so CI coverage is unit-tests only.
+addopts = "-ra --cov=vscc_mqtt_timescale_worker --cov-report=term-missing --cov-fail-under=18"
 
 [tool.ruff]
 line-length = 120

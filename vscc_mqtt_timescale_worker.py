@@ -272,7 +272,8 @@ async def tail_file(config: dict[str, Any], client: aiomqtt.Client):
                                 numerics_buffer.append((parsed_time, physio_id, value_float))
                                 payload = json.dumps({"time": parsed_time.timestamp(), "physio_id": physio_id, "value": value_float})
                                 await client.publish(topic, payload=payload, qos=0)
-                        except Exception: pass
+                        except Exception as e:
+                            print(f"Skipped bad JSON line on {topic}: {e} | {line[:120]!r}")
                     elif file_type == "csv":
                         try:
                             parts = line.split(',')
@@ -285,7 +286,8 @@ async def tail_file(config: dict[str, Any], client: aiomqtt.Client):
                             waveforms_buffer.append((parsed_time, physio_id, value_float))
                             payload = json.dumps({"time": parsed_time.timestamp(), "physio_id": physio_id, "value": value_float})
                             await client.publish(topic, payload=payload, qos=0)
-                        except Exception: pass
+                        except Exception as e:
+                            print(f"Skipped bad CSV line on {topic}: {e} | {line[:120]!r}")
 
         except Exception as e:
             print(f"Error tailing {file_path.name}: {e}")
