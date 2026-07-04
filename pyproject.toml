@@ -1,10 +1,12 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Coverage gate: measures the worker module (what the unit tests exercise) and
-# fails if it drops below the floor. The floor is intentionally just under the
-# current level and should be ratcheted up as async-path tests land (WOR-7).
+# fails if it drops below the floor; ratcheted when the WOR-7 async tests landed.
 # test_api.py skips without a live worker, so CI coverage is unit-tests only.
-addopts = "-ra --cov=vscc_mqtt_timescale_worker --cov-report=term-missing --cov-fail-under=18"
+addopts = "-ra --cov=vscc_mqtt_timescale_worker --cov-report=term-missing --cov-fail-under=28"
+# Async tests (tests/test_tailer.py) are written as plain `async def` and run by
+# pytest-asyncio without a per-test marker.
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 120

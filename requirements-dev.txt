@@ -5,6 +5,7 @@
 #   VSCC_TEST_BASE=http://localhost:8001 pytest tests/ -q
 -r requirements.txt
 pytest>=8.0
+pytest-asyncio
 pytest-cov
 ruff
 mypy
