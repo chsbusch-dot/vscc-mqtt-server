@@ -1,15 +1,16 @@
 import asyncio
-import os
 import json
-from pathlib import Path
+import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
+
 import aiofiles
 import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse, StreamingResponse
 
 BASE_DIR = Path(__file__).resolve().parent
 # Use absolute path to ensure file is found regardless of where script is run
@@ -53,12 +54,12 @@ def parse_vsc_timestamp(raw_time: str) -> datetime | None:
         return None
     try:
         # Try parsing with microseconds first
-        return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S.%f").replace(tzinfo=MONITOR_TZ).astimezone(timezone.utc)
+        return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S.%f").replace(tzinfo=MONITOR_TZ).astimezone(UTC)
     except ValueError:
         pass
     try:
         # Fallback for timestamps without milliseconds
-        return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S").replace(tzinfo=MONITOR_TZ).astimezone(timezone.utc)
+        return datetime.strptime(raw_time, "%d-%m-%Y %H:%M:%S").replace(tzinfo=MONITOR_TZ).astimezone(UTC)
     except ValueError:
         return None
 
@@ -74,7 +75,7 @@ async def tail_file_and_broadcast():
     last_size = 0
 
     # Use aiofiles for true non-blocking disk reads
-    async with aiofiles.open(FILE_PATH, mode="r") as f:
+    async with aiofiles.open(FILE_PATH) as f:
         # Jump to the end of the file to start reading live data
         await f.seek(0, os.SEEK_END)
         last_size = os.path.getsize(FILE_PATH)

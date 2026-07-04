@@ -10,7 +10,7 @@ observable effect, then cancels. Tests are plain `async def` run by pytest-async
 """
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import vscc_mqtt_timescale_worker as w
 
@@ -124,7 +124,7 @@ async def test_tail_file_csv_publishes_waveform(tmp_path):
 
 async def test_batch_inserter_flushes_numerics():
     w.db_pool = FakePool()
-    w.numerics_buffer = [(datetime(2026, 3, 14, 4, 39, tzinfo=timezone.utc), "NOM_HR", 88.0)]
+    w.numerics_buffer = [(datetime(2026, 3, 14, 4, 39, tzinfo=UTC), "NOM_HR", 88.0)]
     w.waveforms_buffer = []
     task = asyncio.create_task(w.batch_inserter())
     try:

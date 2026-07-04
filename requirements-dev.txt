@@ -6,6 +6,7 @@
 -r requirements.txt
 pytest>=8.0
 pytest-asyncio
+pytest-cov
 ruff
 mypy
 httpx>=0.27
