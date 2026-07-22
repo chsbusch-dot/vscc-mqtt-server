@@ -27,3 +27,9 @@ htmlcov/
 # Runtime session exports (bind-mounted output, may be many GB)
 sessions/
 .env
+
+# BI camera .reg exports contain API tokens/keys — never commit
+cam settings/
+
+# Claude Code: local config (settings.local.json, launch.json) + transient agent worktrees
+.claude/
