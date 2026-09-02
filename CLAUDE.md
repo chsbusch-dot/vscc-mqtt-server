@@ -28,8 +28,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
 ## Workflow
 
-- Branch → implement → tests → PR. **Don't merge your own PR** — leave it for
-  Chris to review (an auto-guard enforces this).
+- Branch → implement → tests → PR. Merge policy: the global rule applies (merge and deploy by default when the gate is green, in scope, no uncertainty, not in the always-ask set); never force-push. Linear closes the ticket on merge (Closes WOR-#).
 - **Tracking is in Linear, team WOR.** File follow-ups there; put `Closes WOR-#`
   in the PR body so it auto-closes on merge.
 - Never change repo visibility — only Chris does that.
