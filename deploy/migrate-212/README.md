@@ -28,8 +28,8 @@ worker ever starts.
 |---|---|---|
 | 1 | homelab | cold clone of VM 242's disk; attach to `.135` as a linked disk |
 | 2 | `.135`, root | `sudo bash extract-from-clone.sh /dev/sdX` (Chris types the sudo password): positive ID of the clone, `vgimportclone`, read-only mount, cold PGDATA tarball + capture config + inventory + `SHA256SUMS` |
-| 3 | `.135`, chris | `bash stage-dump.sh ~/vscc-extract`: scratch TimescaleDB on the cold copy with `timescaledb.max_background_workers=0` and no network. Writes the sizes/rows/min-max manifest and `pg_dump -Fc` |
-| 4 | Mac | copy the extract and dump to the Mac staging folder (LAN only, not a cloud-synced path), verify the checksums, delete the copy on `.135`; homelab detaches the clone |
+| 3 | Mac | copy the extract to the Mac staging folder (`~/vscc-migration-staging`, mode 700, not a cloud-synced path), verify `SHA256SUMS`, delete the copy on `.135`; homelab detaches the clone |
+| 4 | Mac, Colima profile `vscc-stage` | `DOCKER_CONTEXT=colima-vscc-stage bash stage-dump.sh ~/vscc-migration-staging`: scratch TimescaleDB on the cold copy with `timescaledb.max_background_workers=0` and no network. Writes the sizes/rows/min-max manifest and `pg_dump -Fc`; then `colima delete --profile vscc-stage` |
 | 5 | homelab | thin VMDK of about 2x the measured size on `DS2_R740_1TB_NVME`, ext4, `/srv/vscc-data`, fstab by UUID with `nofail` |
 | 6 | Mac -> `.212` | `RETENTION_HOURS=<n> restore-to-212.sh <staging>`: fresh initdb into `/srv/vscc-data/timescaledb` with bgworkers off, `timescaledb_pre_restore()`, streamed `pg_restore`, `timescaledb_post_restore()`, retention set (it refuses a value that would purge restored rows), per-table rows and min/max time compared with the source manifest |
 | 7 | Mac | `deploy/vscc-deploy.sh`: the full stack comes up |
