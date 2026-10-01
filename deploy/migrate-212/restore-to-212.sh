@@ -3,11 +3,18 @@
 # Run FROM THE MAC, after homelab has confirmed /srv/vscc-data is mounted, and
 # BEFORE the vscc stack is started for the first time:
 #
-#   RETENTION_HOURS=<n> deploy/migrate-212/restore-to-212.sh <staging-dir>
+#   RETENTION_HOURS=<n> [CHUNK_INTERVAL='1 hour'] [SESSIONS_TGZ=<tgz>] \
+#       deploy/migrate-212/restore-to-212.sh <staging-dir>/<volume>
 #
-# <staging-dir> holds stage-dump.sh's output: telemetry.dump, source-manifest.txt,
-# source-verify.tsv. The dump is streamed over ssh into pg_restore, so it is never
-# written to .212's disks.
+# <staging-dir>/<volume> holds stage-dump.sh's output: telemetry.dump,
+# source-manifest.txt, source-verify.tsv. The dump is streamed over ssh into
+# pg_restore, so it is never written to .212's disks.
+# CHUNK_INTERVAL (optional) sets the hypertables' chunk size before anything is
+# written. Retention drops WHOLE chunks, so with the default 7-day chunks a 12 h
+# retention still keeps up to ~7.5 days of capture (measured 2026-09-30: about
+# 7.4 GB per day of continuous capture); '1 hour' makes the retention bound real.
+# SESSIONS_TGZ (optional) is the extract's session-export tarball; it is unpacked
+# into /srv/vscc-data/sessions (existing files are kept).
 #
 # Order matters. The worker re-applies vscc_settings.retention_hours on every
 # start, and the TimescaleDB scheduler runs an overdue retention job at once.
@@ -27,6 +34,12 @@ set -euo pipefail
 STAGE=${1:?usage: RETENTION_HOURS=<n> restore-to-212.sh <staging-dir>}
 : "${RETENTION_HOURS:?set RETENTION_HOURS (the retention the restored DB gets; see deploy/migrate-212/README.md)}"
 [[ "$RETENTION_HOURS" =~ ^[1-9][0-9]*$ ]] || { echo "RETENTION_HOURS must be a positive integer"; exit 2; }
+CHUNK_INTERVAL=${CHUNK_INTERVAL:-}
+if [ -n "$CHUNK_INTERVAL" ] && ! [[ "$CHUNK_INTERVAL" =~ ^[1-9][0-9]*\ (minutes?|hours?|days?)$ ]]; then
+    echo "CHUNK_INTERVAL must look like '1 hour' / '6 hours' / '1 day'"; exit 2
+fi
+SESSIONS_TGZ=${SESSIONS_TGZ:-}
+[ -z "$SESSIONS_TGZ" ] || [ -s "$SESSIONS_TGZ" ] || { echo "SESSIONS_TGZ $SESSIONS_TGZ not found"; exit 2; }
 HOST=${HOST:-chris@192.168.1.212}
 DB=telemetry
 CT=vscc-restore-pg
@@ -103,6 +116,12 @@ psql212 -c "\"INSERT INTO vscc_settings (key, value) VALUES ('retention_hours', 
         -c "\"SELECT add_retention_policy('patient_numerics', INTERVAL '$RETENTION_HOURS hours', if_not_exists => TRUE)\"" \
         -c "\"SELECT remove_retention_policy('patient_waveforms', if_exists => TRUE)\"" \
         -c "\"SELECT add_retention_policy('patient_waveforms', INTERVAL '$RETENTION_HOURS hours', if_not_exists => TRUE)\"" >/dev/null
+if [ -n "$CHUNK_INTERVAL" ]; then
+    echo "== chunk interval: $CHUNK_INTERVAL (applies to chunks created from now on)"
+    psql212 -c "\"SELECT set_chunk_time_interval('patient_numerics', INTERVAL '$CHUNK_INTERVAL')\"" \
+            -c "\"SELECT set_chunk_time_interval('patient_waveforms', INTERVAL '$CHUNK_INTERVAL')\"" >/dev/null
+fi
+psql212 -c "\"SELECT hypertable_name, time_interval FROM timescaledb_information.dimensions ORDER BY 1\""
 psql212 -c "\"SELECT job_id, proc_name, hypertable_name, config FROM timescaledb_information.jobs ORDER BY 1\""
 
 echo "== verify against the source manifest"
@@ -118,6 +137,12 @@ while IFS=$'\t' read -r table rows tmin tmax; do
     fi
     if [ "$got" = "$want" ]; then echo "MATCH $table rows=$rows"; else echo "DIFF  $table source=[$want] target=[$got]"; fail=1; fi
 done < "$VERIFY"
+
+if [ -n "$SESSIONS_TGZ" ]; then
+    echo "== session exports -> /srv/vscc-data/sessions"
+    rin "sudo tar -xzf - -C /srv/vscc-data/sessions --skip-old-files --strip-components=4 home/chris/vscc-mqtt-server/sessions" < "$SESSIONS_TGZ"
+    r 'sudo find /srv/vscc-data/sessions -type f | wc -l | sed "s/^/session export files: /"'
+fi
 
 r "docker stop -t 60 $CT >/dev/null && docker rm $CT >/dev/null"
 r 'df -h /srv/vscc-data | tail -1; sudo du -sh /srv/vscc-data/timescaledb'

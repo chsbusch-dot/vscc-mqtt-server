@@ -85,7 +85,8 @@ services:
     container_name: vscc-worker
     ports: !reset []
     environment:
-      SESSION_LABEL_TZ: ${SESSION_LABEL_TZ:-UTC}
+      # localizes auto-session label text only; data stays UTC (VM 242 used the same)
+      SESSION_LABEL_TZ: ${SESSION_LABEL_TZ:-America/Los_Angeles}
     volumes: !override
       - vscc-data:/data
       - type: bind

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Mac staging step (2026-09-30 migration off VM 242). It turns the COLD PGDATA
-# tarball read off the VM 242 disk clone (extract-from-clone.sh) into:
+# tarball read off the VM 242 disk clone (extract-from-clone.sh) into, under
+# <staging-dir>/<volume>/ (one subdirectory per PGDATA volume on the clone):
 #   source-manifest.txt  versions, DB and hypertable sizes, per-table row counts
 #                        + min/max time, TimescaleDB jobs, vscc_settings;
 #                        restore-to-212.sh verifies the restore against it
@@ -12,7 +13,7 @@
 # network. That is the whole point: a TimescaleDB scheduler would run the
 # overdue retention job at once and drop the history before it is dumped.
 #
-#   DOCKER_CONTEXT=colima-vscc-stage bash stage-dump.sh <staging-dir>
+#   DOCKER_CONTEXT=colima-vscc-stage bash stage-dump.sh <staging-dir> pgdata-<volume>.tgz
 # Run it on the Mac staging copy, against a DEDICATED Colima profile
 # (`colima start --profile vscc-stage --vm-type vz --arch aarch64 --disk 120`).
 # On 2026-09-30 the default profile was unusable (I/O errors) and the .135
@@ -24,22 +25,25 @@
 # chat or a cloud tool.
 set -euo pipefail
 
-STAGE=${1:?usage: stage-dump.sh <extract-dir holding pgdata-*.tgz + SHA256SUMS>}
+STAGE=${1:?usage: stage-dump.sh <staging-dir holding pgdata-*.tgz + SHA256SUMS> pgdata-<volume>.tgz}
+TGZ=${2:?name the PGDATA tarball to stage, e.g. pgdata-vscc-mqtt-server_timescaledb_data.tgz}
 IMAGE=${IMAGE:-timescale/timescaledb:2.19.3-pg14}
 VOL=vscc-stage-pgdata
 CT=vscc-stage-pg
 cd "$STAGE"
 
 if command -v sha256sum >/dev/null; then SHA=(sha256sum); else SHA=(shasum -a 256); fi
-"${SHA[@]}" -c SHA256SUMS
-tgzs=(pgdata-*.tgz)
-[ "${#tgzs[@]}" = 1 ] || { echo "expected exactly one pgdata-*.tgz, found: ${tgzs[*]}"; exit 2; }
+grep -F " $TGZ" SHA256SUMS | "${SHA[@]}" -c -
+SRC="$PWD/$TGZ"
+vol=${TGZ#pgdata-}; vol=${vol%.tgz}
+mkdir -p "$vol"
+cd "$vol"
 
 docker rm -f "$CT" >/dev/null 2>&1 || true
 docker volume rm "$VOL" >/dev/null 2>&1 || true
 docker volume create "$VOL" >/dev/null
 docker run --rm -i --network none --entrypoint tar -v "$VOL":/stage "$IMAGE" \
-    --numeric-owner -xzf - -C /stage < "${tgzs[0]}"
+    --numeric-owner -xzf - -C /stage < "$SRC"
 
 # Small, fixed settings on the command line override the VM-tuned postgresql.conf
 # inside PGDATA (sized for VM 242, not for this scratch server).
@@ -66,7 +70,7 @@ M=source-manifest.txt
 V=source-verify.tsv
 : > "$V"
 {
-    echo "# VM 242 TimescaleDB, staged $(date -u +%FT%TZ) from ${tgzs[0]} (bgworkers disabled)"
+    echo "# VM 242 TimescaleDB, staged $(date -u +%FT%TZ) from $TGZ (bgworkers disabled)"
     q postgres "SELECT version()"
     q postgres "SHOW timescaledb.max_background_workers" | sed 's/^/timescaledb.max_background_workers=/'
     echo; echo "## databases"
