@@ -103,6 +103,22 @@ grep 'error:' "$STAGE/restore-212.log" | head -20 || true
 psql212 -c "'SELECT timescaledb_post_restore()'" >/dev/null
 psql212 -c "'ANALYZE'" >/dev/null
 
+# Verify BEFORE the retention step: that step adds a retention_hours row to
+# vscc_settings on purpose, which the source may not have had.
+echo "== verify against the source manifest"
+fail=0
+while IFS=$'\t' read -r table rows tmin tmax; do
+    if [ -n "$tmin" ]; then
+        col=$(psql212 -c "\"SELECT column_name FROM timescaledb_information.dimensions WHERE format('%I.%I', hypertable_schema, hypertable_name) = '$table' AND dimension_number = 1\"")
+        got=$(psql212 -c "\"SELECT count(*), min($col), max($col) FROM $table\"")
+        want=$(printf '%s\t%s\t%s' "$rows" "$tmin" "$tmax")
+    else
+        got=$(psql212 -c "\"SELECT count(*) FROM $table\"")
+        want=$rows
+    fi
+    if [ "$got" = "$want" ]; then echo "MATCH $table rows=$rows"; else echo "DIFF  $table source=[$want] target=[$got]"; fail=1; fi
+done < "$VERIFY"
+
 echo "== retention: $RETENTION_HOURS h"
 oldest_h=$(psql212 -c "\"SELECT COALESCE(ceil(extract(epoch FROM now() - least((SELECT min(time) FROM patient_numerics), (SELECT min(time) FROM patient_waveforms))) / 3600), 0)::bigint\"")
 echo "oldest restored row is ${oldest_h} h old"
@@ -123,20 +139,6 @@ if [ -n "$CHUNK_INTERVAL" ]; then
 fi
 psql212 -c "\"SELECT hypertable_name, time_interval FROM timescaledb_information.dimensions ORDER BY 1\""
 psql212 -c "\"SELECT job_id, proc_name, hypertable_name, config FROM timescaledb_information.jobs ORDER BY 1\""
-
-echo "== verify against the source manifest"
-fail=0
-while IFS=$'\t' read -r table rows tmin tmax; do
-    if [ -n "$tmin" ]; then
-        col=$(psql212 -c "\"SELECT column_name FROM timescaledb_information.dimensions WHERE format('%I.%I', hypertable_schema, hypertable_name) = '$table' AND dimension_number = 1\"")
-        got=$(psql212 -c "\"SELECT count(*), min($col), max($col) FROM $table\"")
-        want=$(printf '%s\t%s\t%s' "$rows" "$tmin" "$tmax")
-    else
-        got=$(psql212 -c "\"SELECT count(*) FROM $table\"")
-        want=$rows
-    fi
-    if [ "$got" = "$want" ]; then echo "MATCH $table rows=$rows"; else echo "DIFF  $table source=[$want] target=[$got]"; fail=1; fi
-done < "$VERIFY"
 
 if [ -n "$SESSIONS_TGZ" ]; then
     echo "== session exports -> /srv/vscc-data/sessions"
