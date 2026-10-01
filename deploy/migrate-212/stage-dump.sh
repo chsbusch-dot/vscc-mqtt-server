@@ -12,12 +12,16 @@
 # network. That is the whole point: a TimescaleDB scheduler would run the
 # overdue retention job at once and drop the history before it is dumped.
 #
-#   bash stage-dump.sh <extract-dir>
-# Run it on a LAN Docker host holding the extract. On 2026-09-30 that was the
-# .135 helper where extract-from-clone.sh wrote it: same x86_64 architecture as
-# the source PGDATA (the Mac's Colima VM was unusable). Only the outputs plus
-# the cold tarball then go to the Mac staging folder. Patient data: everything
-# here stays on the LAN; never paste rows or dumps into a chat or a cloud tool.
+#   DOCKER_CONTEXT=colima-vscc-stage bash stage-dump.sh <staging-dir>
+# Run it on the Mac staging copy, against a DEDICATED Colima profile
+# (`colima start --profile vscc-stage --vm-type vz --arch aarch64 --disk 120`).
+# On 2026-09-30 the default profile was unusable (I/O errors) and the .135
+# helper has no Docker; `colima delete --profile vscc-stage` removes the scratch
+# VM, PHI included, afterwards. x86_64 -> aarch64 PGDATA is fine here: both are
+# 64-bit little-endian with the same alignment, the same alpine/musl image runs on
+# both sides, and postgres refuses to start on a pg_control mismatch anyway.
+# Patient data: everything stays on the LAN; never paste rows or dumps into a
+# chat or a cloud tool.
 set -euo pipefail
 
 STAGE=${1:?usage: stage-dump.sh <extract-dir holding pgdata-*.tgz + SHA256SUMS>}
