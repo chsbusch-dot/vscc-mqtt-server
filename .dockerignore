@@ -21,6 +21,8 @@ vscc-capture-loop.sh
 # Docker and database setup files
 vscc-docker-compose.yml
 docker-compose.yml
+compose.production.yml
+deploy/
 vscc-init-timescaledb.sql
 vscc-mosquitto.conf.bak
 
