@@ -112,7 +112,7 @@ services:
     logging: *logging
 
   dashboard:
-    image: ghcr.io/chsbusch-dot/vscc-dashboard:latest@sha256:e7003d733ccf7f16c350d6fe119887bd6d83f1583f6ef0d7f2bd4e079a18a858
+    image: ghcr.io/chsbusch-dot/vscc-dashboard:latest@sha256:24359fc8d773b0a546a8e29b8a7dad1a2920b6635e10515b52177b79d7706aac
     container_name: vscc-dashboard
     ports: !reset []
     environment:
