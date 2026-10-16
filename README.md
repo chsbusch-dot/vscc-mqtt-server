@@ -346,7 +346,7 @@ Logs: `journalctl -u vscc-capture-cli -f`, `journalctl -u vscc-websocket-streame
 The installer automatically sets up cron jobs to keep the system running smoothly.
 
 -   **Hourly File Cleanup:** The `VSCaptureCLI` tool generates several large data files. To prevent these from consuming excessive disk space, the `vscc-file-cleanup.py` script runs every hour, truncates any data file that grows beyond 20MB, and then restarts the VSCapture process (via the keep-alive wrapper) so it re-binds to the fresh file inodes.
--   **Quarterly Updates:** The `update.sh` script runs every three months and pulls the images referenced in `vscc-docker-compose.yml`. Image tags are **pinned** (`emqx/emqx:6.0.0`, `timescale/timescaledb:2.19.3-pg14`), so upgrades only happen when a tag is deliberately bumped in the compose file — floating `latest` tags previously risked unattended breaking upgrades.
+-   **Quarterly Updates:** The `update.sh` script runs every three months and pulls the images referenced in `vscc-docker-compose.yml`. Image tags are **pinned** (`emqx/emqx:6.3.2`, `timescale/timescaledb:2.19.3-pg14`), so upgrades only happen when a tag is deliberately bumped in the compose file — floating `latest` tags previously risked unattended breaking upgrades.
 
 ## Testing VSCapture's Direct MQTT Export
 

@@ -32,7 +32,7 @@ x-logging: &logging
 
 services:
   emqx:
-    image: emqx/emqx:6.0.0@sha256:8426e9b5a1fd7717fa9aaf5bb0ec53e68b5318ecab8d494e4ef720aa7bbfbe7a
+    image: emqx/emqx:6.3.2@sha256:a2dc77317eff45a966f11efefaa89b90c790ae031463da2a6f23051ed2d5dc69
     container_name: vscc-emqx
     ports: !reset []
     volumes:

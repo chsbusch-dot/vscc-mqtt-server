@@ -13,7 +13,7 @@ services:
     restart: unless-stopped
 
   vscc-emqx:
-    image: emqx/emqx:6.0.0
+    image: emqx/emqx:6.3.2
     ports:
       - "1883:1883"
       - "8083:8083"
