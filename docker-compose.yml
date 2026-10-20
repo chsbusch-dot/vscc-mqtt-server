@@ -16,7 +16,7 @@ name: vscc
 
 services:
   emqx:
-    image: emqx/emqx:6.0.0
+    image: emqx/emqx:6.3.2
     ports:
       - "1883:1883"    # MQTT (TCP)
       - "8083:8083"    # MQTT over WebSocket (path /mqtt) — used by the dashboard
