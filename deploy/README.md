@@ -6,7 +6,7 @@ bucket A: containerized, GHCR images, LAN only, patient data stays local.
 
 | | |
 |---|---|
-| URL | `https://vscc.lan.synviron.com`, via caddy-lan and **Authelia** `one_factor` (the app has no login of its own) |
+| URL | `https://vscc.lan.synviron.com`, via caddy-lan and **Authelia**: no login from the LAN since WOR-898, `one_factor` from every other source (see Access below). The app has no login of its own |
 | Host | `prd-ubu-apphost` `192.168.1.212`, compose project `vscc` |
 | Stack dir on the box | `/opt/apphost/vscc` (a `git archive` of this repo, `.deployed-commit`) |
 | Compose | `docker-compose.yml` (base, the public install) + `compose.production.yml` (overlay) |
@@ -33,19 +33,33 @@ MP50 --UDP--> vscc-capture --export files (vscc-data)--> vscc-worker --> EMQX + 
 
 The dashboard builds same-origin URLs whenever it is served over https
 (vscc-dashboard-client `src/utils/backendUrls.ts`). That keeps every request
-behind the one SSO gate and avoids mixed content.
+behind the one caddy-lan gate and avoids mixed content.
+
+**Access since WOR-898.** Authelia's default policy is `deny`. A bypass rule
+lets `lan_clients` in with no login: VLAN1 `192.168.1.0/24` except `.212`
+itself, plus the roam-in VPN `192.168.3.0/24`. Every other source (the other
+VLANs, `.212` itself) still meets the vscc `one_factor` rule and gets a 302 to
+`auth.lan.synviron.com`. The trust is by source address, and VLAN1 also carries
+IoT devices. Ahead of forward_auth, caddy-lan answers 403 to any write (POST,
+PUT, PATCH, DELETE) whose `Sec-Fetch-Site` is `cross-site` or `same-site`, so
+a page on another origin cannot drive the API through a LAN browser.
+Same-origin writes and clients that send no `Sec-Fetch-Site` (curl, scripts)
+pass. Measured 2026-10-24: from the LAN, `GET /` is 200, and a cross-site
+`POST /api/sessions/999999/stop` is 403 while the same request sent
+same-origin reaches the worker. From `.212`, `GET /` and `GET /api/sessions`
+are 302.
 
 **Capture networking.** Bridge networking is enough. VSCapture's LAN mode is
 client-initiated UDP: the association goes to the monitor's port 24105 and the
 data comes back on the same flow, so Docker's NAT/conntrack carries the replies.
-The monitor is on-link from `.212` (same `/24` on `ens32`, no router hop, so no
+The monitor is on-link from `.212` (same `/24` on `ens160`, no router hop, so no
 inter-VLAN firewall in the path). Host networking is not needed.
 
 **MQTT 1883 is not published.** The worker reaches EMQX on the stack network and
 the dashboard uses the WebSocket through the gate. Nothing on the LAN needs raw
 MQTT, and the broker is anonymous, so publishing `1883` would expose live vital
-signs to every LAN host past the SSO gate and past ufw (Docker-published ports
-bypass it). If a LAN consumer ever needs it, publish it deliberately with
+signs to every host that can reach `.212`, with no Authelia policy in front and
+past ufw (Docker-published ports bypass it). If a LAN consumer ever needs it, publish it deliberately with
 authentication and register it in homelab-infra `network/ports.md`.
 
 ## Deploy / update (from the Mac)
@@ -85,5 +99,6 @@ homelab's restic job on `.212` takes a `pg_dump` of the running database
 
 ```bash
 ssh chris@192.168.1.212 'docker compose -p vscc ps; df -h /srv/vscc-data; docker inspect vscc-timescaledb --format "{{range .Mounts}}{{.Source}} -> {{.Destination}}{{println}}{{end}}"'
-curl -sI https://vscc.lan.synviron.com/ | head -1      # 302 to auth.lan.synviron.com without a session
+curl -sI https://vscc.lan.synviron.com/ | head -1      # 200 from the LAN, no login (WOR-898 bypass)
+ssh chris@192.168.1.212 'curl -sI https://vscc.lan.synviron.com/ | head -1'   # 302 to auth.lan.synviron.com: the gated view outside lan_clients
 ```
