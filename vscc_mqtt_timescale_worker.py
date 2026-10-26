@@ -788,6 +788,18 @@ async def delete_session(session_id: int, purge_data: bool = True):
         await conn.execute("DELETE FROM sessions WHERE id = $1", session_id)
     return {"ok": True, "deleted_data_rows": deleted_rows}
 
+def _series_rows(rows) -> list[dict]:
+    """DB rows -> replay points. Aggregated waveform rows also carry the bucket's
+    min/max, so the client can draw the envelope (an averaged ECG is a flat line)."""
+    out = []
+    for x in rows:
+        p = {"time": x["time"].timestamp(), "physio_id": x["physio_id"], "value": float(x["value"])}
+        if "min" in x.keys():
+            p["min"] = None if x["min"] is None else float(x["min"])
+            p["max"] = None if x["max"] is None else float(x["max"])
+        out.append(p)
+    return out
+
 @app.get("/api/sessions/{session_id}/data")
 async def session_data(session_id: int, agg: str = "auto", max_raw_minutes: int = 15,
                        from_ts: float | None = None, to_ts: float | None = None):
@@ -847,22 +859,22 @@ async def session_data(session_id: int, agg: str = "auto", max_raw_minutes: int 
         # Waveforms: 5min re-buckets the 1-min aggregate; 1min/auto read it directly; raw reads samples.
         if agg == "5min":
             waveforms = await conn.fetch(
-                "SELECT time_bucket('5 minutes', bucket) AS time, physio_id, avg(avg_value) AS value "
-                "FROM patient_waveforms_1min WHERE bucket BETWEEN $1 AND $2 GROUP BY 1, physio_id ORDER BY 1",
+                "SELECT time_bucket('5 minutes', bucket) AS time, physio_id, avg(avg_value) AS value, "
+                "min(min_value) AS min, max(max_value) AS max FROM patient_waveforms_1min WHERE bucket BETWEEN $1 AND $2 GROUP BY 1, physio_id ORDER BY 1",
                 win_start, win_end)
         elif aggregated:
             waveforms = await conn.fetch(
-                "SELECT bucket AS time, physio_id, avg_value AS value FROM patient_waveforms_1min "
+                "SELECT bucket AS time, physio_id, avg_value AS value, min_value AS min, max_value AS max "
+                "FROM patient_waveforms_1min "
                 "WHERE bucket BETWEEN $1 AND $2 ORDER BY bucket", win_start, win_end)
         else:
             waveforms = await conn.fetch(
                 "SELECT time, physio_id, value FROM patient_waveforms WHERE time BETWEEN $1 AND $2 ORDER BY time, ctid",
                 win_start, win_end)
-    def fmt(rows): return [{"time": x["time"].timestamp(), "physio_id": x["physio_id"], "value": float(x["value"])} for x in rows]
     # Build the (potentially large) row lists off the event loop so a raw replay
     # doesn't block telemetry ingest and other requests during serialization.
     num_out, wave_out = await asyncio.gather(
-        asyncio.to_thread(fmt, numerics), asyncio.to_thread(fmt, waveforms))
+        asyncio.to_thread(_series_rows, numerics), asyncio.to_thread(_series_rows, waveforms))
     return {"session": _session_dict(r), "aggregated_waveforms": aggregated,
             "numerics": num_out, "waveforms": wave_out}
 

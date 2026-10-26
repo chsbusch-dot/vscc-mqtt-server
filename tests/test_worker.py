@@ -88,3 +88,28 @@ def test_parse_timestamp_winter_offset():
 @pytest.mark.parametrize("bad", ["", "not-a-date", "2026-06-11 12:00:00", None])
 def test_parse_timestamp_invalid_returns_none(bad):
     assert w.parse_vsc_timestamp(bad) is None
+
+
+# --- _series_rows (session replay payload) ------------------------------------
+
+_T = datetime(2026, 6, 11, 19, 0, 0, tzinfo=UTC)
+
+
+def test_series_rows_raw_rows_have_no_range():
+    rows = [{"time": _T, "physio_id": "NOM_ECG_ELEC_POTL_II", "value": 0.25}]
+    assert w._series_rows(rows) == [
+        {"time": _T.timestamp(), "physio_id": "NOM_ECG_ELEC_POTL_II", "value": 0.25},
+    ]
+
+
+def test_series_rows_aggregated_rows_carry_min_max():
+    rows = [{"time": _T, "physio_id": "NOM_ECG_ELEC_POTL_II", "value": 0.1, "min": -0.4, "max": 1.2}]
+    assert w._series_rows(rows) == [
+        {"time": _T.timestamp(), "physio_id": "NOM_ECG_ELEC_POTL_II", "value": 0.1, "min": -0.4, "max": 1.2},
+    ]
+
+
+def test_series_rows_null_range_stays_null():
+    rows = [{"time": _T, "physio_id": "NOM_PLETH", "value": 1.0, "min": None, "max": None}]
+    got = w._series_rows(rows)[0]
+    assert got["min"] is None and got["max"] is None
