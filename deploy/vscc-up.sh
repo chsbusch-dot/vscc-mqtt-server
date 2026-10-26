@@ -32,6 +32,10 @@ C=(docker compose -p vscc -f docker-compose.yml -f compose.production.yml)
 "${C[@]}" config --quiet
 "${C[@]}" pull --quiet
 "${C[@]}" up -d --remove-orphans
+# `up` recreates a container only when its compose entry or image changes, so the
+# dashboard would keep its bind mount of the PREVIOUS tree's dashboard-nginx.conf.
+# Restart it so every deploy serves the shipped nginx config.
+"${C[@]}" restart dashboard
 
 db=starting; wk=starting
 for _ in $(seq 1 36); do
