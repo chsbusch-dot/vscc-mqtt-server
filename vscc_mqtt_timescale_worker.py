@@ -32,6 +32,18 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 DB_DSN = os.getenv("DB_DSN", "postgresql://postgres:password@127.0.0.1:5432/telemetry")
 WAVEFORM_DISCONNECT_TIMEOUT = 3.0  # Seconds
 
+# MQTT publisher resilience (WOR-840). The worker is a PUBLISHER only, and
+# aiomqtt does not auto-reconnect: once the single client dies (e.g. the EMQX
+# container is recreated on its own) nothing revives it, so the worker goes
+# silently mute while still reporting healthy. mqtt_connection_manager reconnects
+# with capped backoff, and a keepalive publish every MQTT_PROBE_INTERVAL forces a
+# silent broker drop to surface even when no patient data is flowing (an idle
+# qos=0 publisher never notices the socket is gone otherwise).
+MQTT_PROBE_INTERVAL = float(os.getenv("MQTT_PROBE_INTERVAL", "5"))   # keepalive publish cadence
+MQTT_RECONNECT_BASE = float(os.getenv("MQTT_RECONNECT_BASE", "2"))   # backoff step, seconds
+MQTT_RECONNECT_MAX = float(os.getenv("MQTT_RECONNECT_MAX", "30"))    # backoff ceiling, seconds
+MQTT_STATUS_TOPIC = os.getenv("MQTT_STATUS_TOPIC", "mp50/_worker/status")
+
 # --- File & Topic Mapping ---
 #
 # Numerics: DataExportVSC.json carries EVERY parameter PhysioID, so any new
@@ -196,6 +208,10 @@ async def batch_inserter():
 
 # --- 2. The Generic Async File Tailer ---
 async def tail_file(config: dict[str, Any], client: aiomqtt.Client):
+    # `client` is the process-wide MqttPublisher in production (a reconnecting
+    # handle whose broker client is swapped underneath on every reconnect), so
+    # this tailer survives a broker restart without being restarted. Tests pass a
+    # fake with the same async publish(topic, payload, qos) shape.
     file_path, file_type, topic = config["path"], config["type"], config["topic"]
     print(f"Waiting for file: {file_path}...")
     while not file_path.exists() or not file_path.is_file(): await asyncio.sleep(1)
@@ -312,6 +328,90 @@ async def wave_discovery_loop(client: aiomqtt.Client, tailed_paths: set):
             print(f"Wave discovery error: {e}")
         await asyncio.sleep(10)
 
+# --- 2c. MQTT publisher resilience (WOR-840) ---
+class MqttPublisher:
+    """A stable publish handle the tailers hold for their whole lifetime.
+
+    The connection manager owns the underlying aiomqtt client and swaps a fresh
+    one in here on every (re)connect, so the tailers keep publishing across a
+    broker restart WITHOUT being cancelled and restarted. Restarting a tailer
+    would re-seek its file to EOF and drop the rows written during the outage;
+    here the tail loops never stop, so the DB ingest path (which buffers a row
+    BEFORE publishing it) keeps running throughout. While disconnected, publish()
+    is a no-op -- only the live MQTT frames are dropped, never the DB rows.
+    """
+
+    def __init__(self) -> None:
+        self._client: aiomqtt.Client | None = None
+        self.connected: bool = False
+        self.connects: int = 0           # successful (re)connects this process-lifetime
+        self.last_connect: datetime | None = None
+        self.last_error: str | None = None
+
+    def bind(self, client: aiomqtt.Client) -> None:
+        self._client = client
+        self.connected = True
+        self.connects += 1
+        self.last_connect = datetime.now(UTC)
+        self.last_error = None
+
+    def unbind(self, error: BaseException | None = None) -> None:
+        self._client = None
+        self.connected = False
+        if error is not None:
+            self.last_error = f"{type(error).__name__}: {error}"
+
+    async def publish(self, topic: str, payload: Any = None, qos: int = 0) -> None:
+        client = self._client
+        if client is None:
+            return  # disconnected: drop the live frame, the DB ingest already has the row
+        try:
+            await client.publish(topic, payload=payload, qos=qos)
+        except aiomqtt.MqttError as e:
+            # Trip the manager into reconnecting and flip /api/status to 503.
+            self.unbind(e)
+
+
+# Process-wide publisher handle. Created at import so /api/status works before
+# the lifespan starts and under test; the manager (re)binds its client.
+mqtt_publisher = MqttPublisher()
+
+
+async def mqtt_connection_manager(publisher: MqttPublisher) -> None:
+    """Own the single publishing client for the whole process: connect, and on
+    ANY disconnection recreate the client and rebind `publisher`, with capped
+    backoff. The keepalive publish makes a silent broker drop surface within
+    MQTT_PROBE_INTERVAL so /api/status (and the container health check) go red."""
+    attempt = 0
+    while True:
+        try:
+            async with aiomqtt.Client(MQTT_BROKER, port=MQTT_PORT) as client:
+                publisher.bind(client)
+                attempt = 0
+                print(f"Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT} "
+                      f"(connection #{publisher.connects}).")
+                while publisher.connected:
+                    await asyncio.sleep(MQTT_PROBE_INTERVAL)
+                    if not publisher.connected:
+                        break  # a data publish already detected the drop
+                    await client.publish(
+                        MQTT_STATUS_TOPIC,
+                        payload=json.dumps({"worker": "up", "time": datetime.now(UTC).timestamp()}),
+                        qos=0)
+        except asyncio.CancelledError:
+            publisher.unbind()
+            raise
+        except Exception as e:
+            publisher.unbind(e)
+            print(f"MQTT connection lost: {e!r}.")
+        else:
+            publisher.unbind()
+        attempt += 1
+        delay = min(MQTT_RECONNECT_MAX, MQTT_RECONNECT_BASE * attempt)
+        print(f"Reconnecting to MQTT in {delay:.0f}s...")
+        await asyncio.sleep(delay)
+
+
 # --- 3. Schema bootstrap, App Lifespan & FastAPI ---
 
 # Mirrors vscc-init-timescaledb.sql so the stack also runs without the init.sql
@@ -411,30 +511,28 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"Could not write capture config file: {e}")
     
-    tasks = []
-    app_started = False
+    # The tailers publish through a stable handle (mqtt_publisher); the broker
+    # client behind it is owned and (re)connected by mqtt_connection_manager, so
+    # the tailers are started ONCE and survive a broker restart (WOR-840). We no
+    # longer gate startup on the first MQTT connect: the worker serves HTTP
+    # immediately, and /api/status reports mqtt_connected=false (HTTP 503, which
+    # trips the container health check) until the broker is reachable. At boot
+    # EMQX can take ~15s longer than this container; the compose health check's
+    # start_period covers that window.
+    tasks = [
+        asyncio.create_task(batch_inserter()),
+        asyncio.create_task(session_manager()),
+        asyncio.create_task(gap_watchdog()),
+        asyncio.create_task(mqtt_connection_manager(mqtt_publisher)),
+        # Numerics: one fixed JSON tailer (carries every parameter PhysioID).
+        asyncio.create_task(tail_file(NUMERICS_CONFIG, mqtt_publisher)),
+        # Waveforms: discovered dynamically so new modules stream with no code change.
+        asyncio.create_task(wave_discovery_loop(mqtt_publisher, set())),
+    ]
+    print("Launched MQTT connection manager + numerics tailer + waveform "
+          "auto-discovery + DB batch worker + watchdog.")
     try:
-        while not app_started:
-            try:
-                async with aiomqtt.Client(MQTT_BROKER, port=MQTT_PORT) as client:
-                    print(f"Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
-                    tasks.append(asyncio.create_task(batch_inserter()))
-                    tasks.append(asyncio.create_task(session_manager()))
-                    tasks.append(asyncio.create_task(gap_watchdog()))
-                    # Numerics: one fixed JSON tailer (carries every parameter PhysioID).
-                    tasks.append(asyncio.create_task(tail_file(NUMERICS_CONFIG, client)))
-                    # Waveforms: discovered dynamically so new modules stream with no code change.
-                    tasks.append(asyncio.create_task(wave_discovery_loop(client, set())))
-                    print("Launched numerics tailer + waveform auto-discovery + DB batch worker + watchdog.")
-                    app_started = True
-                    yield
-            except aiomqtt.MqttError as e:
-                # At boot the EMQX container can take ~15s longer than this one.
-                if app_started:
-                    print(f"MQTT connection closed during shutdown: {e}")
-                else:
-                    print(f"MQTT broker not ready: {e}. Retrying in 5s...")
-                    await asyncio.sleep(5)
+        yield
     finally:
         print("Shutting down... Cancelling background tasks.")
         for task in tasks: task.cancel()
@@ -665,9 +763,15 @@ def _sources_view(now: datetime) -> dict[str, Any]:
     } for dev, s in source_state.items()}
 
 @app.get("/api/status")
-async def status():
+async def status(response: Response):
     """Health snapshot for dashboards/monitoring: capture state, last-data age,
-    DB lag, buffer backlog, per-source integrity."""
+    DB lag, buffer backlog, per-source integrity, MQTT connection state.
+
+    When MQTT is disconnected the worker cannot publish (even though DB ingest
+    continues), so this returns HTTP 503 -- that is what flips the container
+    health check red while the broker is down (WOR-840). The JSON body is
+    unchanged apart from the added `mqtt_connected` field, so dashboards that read
+    the body still get every field; only strict HTTP-status consumers react."""
     now = datetime.now(UTC)
     state, age = _capture_state(now)
     db_lag = db_size = None
@@ -678,6 +782,8 @@ async def status():
         db_lag = (now - db_max).total_seconds() if db_max else None
     except Exception as e:
         print(f"status db query failed: {e}")
+    if not mqtt_publisher.connected:
+        response.status_code = 503
     return {
         "capture_state": state,
         "last_data_age_seconds": age,
@@ -686,6 +792,9 @@ async def status():
         "worker_uptime_seconds": (now - WORKER_START).total_seconds() if WORKER_START else None,
         "buffer_backlog": {"numerics": len(numerics_buffer), "waveforms": len(waveforms_buffer)},
         "inserted_total": dict(inserted_totals),
+        "mqtt_connected": mqtt_publisher.connected,
+        "mqtt_reconnects": max(0, mqtt_publisher.connects - 1),
+        "mqtt_last_error": mqtt_publisher.last_error,
         "sources": _sources_view(now),
         "thresholds": {"stall_s": CAPTURE_STALL_S, "offline_s": CAPTURE_OFFLINE_S},
     }
