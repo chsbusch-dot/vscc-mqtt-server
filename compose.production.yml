@@ -105,7 +105,7 @@ services:
     logging: *logging
 
   streamer:
-    image: ghcr.io/chsbusch-dot/vscc-streamer:latest@sha256:1aa5878ef33288264cf2c00bffd9e32a8c6bdc779b9ea4ee80d36c460f005e84
+    image: ghcr.io/chsbusch-dot/vscc-streamer:latest@sha256:085f608376ae99577e47935b7c1695579464afd0317257018da2d850556fdce6
     container_name: vscc-streamer
     ports: !reset []
     mem_limit: 256m
