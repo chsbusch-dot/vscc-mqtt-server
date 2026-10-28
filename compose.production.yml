@@ -70,7 +70,7 @@ services:
     logging: *logging
 
   capture:
-    image: ghcr.io/chsbusch-dot/vscc-capture:latest@sha256:9a626324bc285f7a25c88b6cf86055c2e507830163be4336c1bd3a00aa27f5de
+    image: ghcr.io/chsbusch-dot/vscc-capture:latest@sha256:f081967e98021fcf149d9d4627d7661762bf773a1ae86f731fd0ea45fac6c88c
     container_name: vscc-capture
     # Bridge networking is enough: VSCapture's LAN mode is client-initiated UDP
     # to the monitor (association on port 24105, data back on the same flow), so
@@ -81,7 +81,7 @@ services:
     logging: *logging
 
   worker:
-    image: ghcr.io/chsbusch-dot/vscc-worker:latest@sha256:e9d85568bd0c4dc6c3dd0c176716343afe49111e25f4b2e05202e444a70bbaf0
+    image: ghcr.io/chsbusch-dot/vscc-worker:latest@sha256:ac12f5386ba77d2b435493b3943249d476cbc1e3b4fd23796391bb7ee65a0446
     container_name: vscc-worker
     ports: !reset []
     environment:
