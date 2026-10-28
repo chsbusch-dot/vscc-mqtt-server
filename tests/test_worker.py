@@ -8,7 +8,7 @@ They deliberately avoid the async I/O paths (file tailing, MQTT publish, DB
 insert); those need integration fixtures and are tracked separately.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -113,3 +113,49 @@ def test_series_rows_null_range_stays_null():
     rows = [{"time": _T, "physio_id": "NOM_PLETH", "value": 1.0, "min": None, "max": None}]
     got = w._series_rows(rows)[0]
     assert got["min"] is None and got["max"] is None
+
+
+# --- _wave_quality (session quality report) ------------------------------------
+
+def _quality_row(frame_rows: int, span_s: int, samples: int) -> dict:
+    return {"physio_id": "NOM_ECG_ELEC_POTL_II", "rate_hz": frame_rows, "samples": samples,
+            "first_sec": _T, "last_sec": _T + timedelta(seconds=span_s - 1),
+            "gap_count": 0, "longest_gap_s": 0}
+
+
+@pytest.mark.parametrize("frame_rows,rate", [(768, 750.0), (128, 125.0), (64, 62.5)])
+def test_wave_quality_rate_is_frame_rows_over_frame_period(frame_rows, rate):
+    q = w._wave_quality(_quality_row(frame_rows, 1000, round(rate * 1000)))
+    assert q["rate_hz"] == rate
+    assert q["frame_rows"] == frame_rows
+    assert q["expected_samples"] == round(rate * 1000)
+    assert q["completeness_pct"] == 100.0
+
+
+def test_wave_quality_complete_capture_is_not_read_as_loss():
+    # A complete hour at the measured frame cadence (768 rows every 1.0245 s)
+    # read 97.6% when the frame rows counted as a per-second rate.
+    span_s = 3600
+    samples = round(768 / 1.0245 * span_s)
+    q = w._wave_quality(_quality_row(768, span_s, samples))
+    assert q["completeness_pct"] > 99.9
+    assert q["missing_samples"] < 0.001 * q["expected_samples"]
+
+
+def test_wave_quality_reports_real_loss():
+    q = w._wave_quality(_quality_row(128, 1000, 62_500))
+    assert q["expected_samples"] == 125_000
+    assert q["missing_samples"] == 62_500
+    assert q["completeness_pct"] == 50.0
+
+
+def test_wave_quality_caps_completeness_at_100():
+    q = w._wave_quality(_quality_row(64, 100, 7_000))
+    assert q["completeness_pct"] == 100.0
+    assert q["missing_samples"] == 0
+
+
+def test_wave_quality_sample_bounds_cover_the_last_second():
+    q = w._wave_quality(_quality_row(64, 10, 625))
+    assert q["first_sample"] == _T.timestamp()
+    assert q["last_sample"] == _T.timestamp() + 10
