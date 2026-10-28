@@ -4,6 +4,8 @@ aiofiles
 asyncpg
 aiomqtt
 uvicorn
+# uvicorn answers a websocket upgrade with 404 unless a websocket library is installed (streamer /ws/stream)
+websockets
 tzdata
 pyarrow
 zipstream-ng
