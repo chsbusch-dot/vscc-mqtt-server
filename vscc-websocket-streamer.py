@@ -66,66 +66,77 @@ def parse_vsc_timestamp(raw_time: str) -> datetime | None:
 # --- 2. Single Background File Tailer ---
 async def tail_file_and_broadcast():
     print(f"Background worker started. Waiting for {FILE_PATH}...")
-    
-    while not FILE_PATH.exists():
-        await asyncio.sleep(1)
 
-    print(f"Found {FILE_PATH}! Starting tail stream...")
-    
-    last_size = 0
+    # The outer loop re-opens the file. The capture cleanup (vscc-file-cleanup.py)
+    # replaces it with tail + mv, a new inode, so the old handle must be swapped
+    # for a new one: re-seeking it only re-reads the deleted file (WOR-974).
+    while True:
+        while not FILE_PATH.exists():
+            await asyncio.sleep(1)
 
-    # Use aiofiles for true non-blocking disk reads
-    async with aiofiles.open(FILE_PATH) as f:
-        # Jump to the end of the file to start reading live data
-        await f.seek(0, os.SEEK_END)
-        last_size = os.path.getsize(FILE_PATH)
+        print(f"Found {FILE_PATH}! Starting tail stream...")
 
-        while True:
-            current_size = os.path.getsize(FILE_PATH)
-            
-            # Handle file rotation or truncation by VSCapture
-            if current_size < last_size:
-                print("File truncated. Resetting to beginning...")
-                await f.seek(0, 0)
-                last_size = 0
+        try:
+            # Use aiofiles for true non-blocking disk reads
+            async with aiofiles.open(FILE_PATH) as f:
+                # Jump to the end of the file to start reading live data
+                await f.seek(0, os.SEEK_END)
+                opened = os.fstat(f.fileno())
+                open_ino = opened.st_ino
+                last_size = opened.st_size
 
-            line = await f.readline()
-            
-            if not line:
-                # 20Hz stream = 50ms between points. 0.05 is a highly optimized sleep.
-                await asyncio.sleep(0.05) 
-                continue
-            
-            last_size = current_size
-            
-            line = line.strip()
-            if line:
-                try:
-                    # Parse raw VSCapture JSON
-                    data = json.loads(line)
-                    if isinstance(data, dict):
-                        data = [data]
-                    
-                    for record in data:
-                        physio_id = record.get("PhysioID")
-                        val_str = record.get("Value", "-")
-                        raw_time = record.get("SystemLocalTime", record.get("Timestamp"))
-                        
-                        if not physio_id or val_str == "-" or not raw_time:
+                while True:
+                    line = await f.readline()
+
+                    if not line:
+                        # At EOF, check that the path still names the file we hold
+                        try:
+                            stat = os.stat(FILE_PATH)
+                        except FileNotFoundError:
+                            break
+                        if stat.st_ino != open_ino:
+                            print("File replaced. Re-opening...")
+                            break
+                        # Truncated in place (same inode): read it from the start
+                        if stat.st_size < last_size:
+                            print("File truncated. Resetting to beginning...")
+                            await f.seek(0, 0)
+                        last_size = stat.st_size
+                        # 20Hz stream = 50ms between points. 0.05 is a highly optimized sleep.
+                        await asyncio.sleep(0.05)
+                        continue
+
+                    line = line.strip()
+                    if line:
+                        try:
+                            # Parse raw VSCapture JSON
+                            data = json.loads(line)
+                            if isinstance(data, dict):
+                                data = [data]
+
+                            for record in data:
+                                physio_id = record.get("PhysioID")
+                                val_str = record.get("Value", "-")
+                                raw_time = record.get("SystemLocalTime", record.get("Timestamp"))
+
+                                if not physio_id or val_str == "-" or not raw_time:
+                                    continue
+
+                                parsed_time = parse_vsc_timestamp(raw_time)
+                                if parsed_time:
+                                    # Normalize to standard payload (Epoch Seconds)
+                                    payload = {
+                                        "time": parsed_time.timestamp(),
+                                        "physio_id": physio_id,
+                                        "value": float(val_str),
+                                        "device_id": record.get("DeviceID", "mp50")
+                                    }
+                                    await manager.broadcast(json.dumps(payload))
+                        except Exception:
                             continue
-                            
-                        parsed_time = parse_vsc_timestamp(raw_time)
-                        if parsed_time:
-                            # Normalize to standard payload (Epoch Seconds)
-                            payload = {
-                                "time": parsed_time.timestamp(),
-                                "physio_id": physio_id,
-                                "value": float(val_str),
-                                "device_id": record.get("DeviceID", "mp50")
-                            }
-                            await manager.broadcast(json.dumps(payload))
-                except Exception:
-                    continue
+        except FileNotFoundError:
+            # Vanished between exists() and open(): wait for it to come back
+            await asyncio.sleep(1)
 
 # --- 3. App Lifespan (Startup/Shutdown logic) ---
 @asynccontextmanager
