@@ -70,11 +70,13 @@ trap terminate TERM INT
 
 echo "[Capture] Container started. Monitor: $DEVICE_IP, waveset: $WAVESET"
 
-# Hourly export-file cleanup (replaces the host cron job)
+# Hourly export-file cleanup (replaces the host cron job). It truncates the
+# export files to their newest 20 MiB, skipping any run while the capture
+# is live (an export file written in the last 10 min).
 (
     while true; do
         sleep 3600
-        python3 /opt/vscc-file-cleanup.py || true
+        VSC_CAPTURE_DIR="$DATA_DIR" python3 /opt/vscc-file-cleanup.py || true
     done
 ) &
 
