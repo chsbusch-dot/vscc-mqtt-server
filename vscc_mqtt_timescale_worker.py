@@ -1121,11 +1121,18 @@ async def session_signals(session_id: int):
 #
 # Waveform timestamps arrive frame-stamped: a whole UDP frame of samples shares
 # one millisecond stamp (e.g. ECG bursts of 192 rows per ms), so sub-second
-# spacing carries no timing information. Per-second sample counts ARE stable
-# (ECG 768/s, Pleth 128/s, Resp 64/s on the MP50), so the nominal rate is the
-# statistical mode of per-second counts and loss is measured against
-# rate x active span. Numerics get plain counts only — many are intermittent
-# by design (NIBP only on inflation), so "expected" would be meaningless.
+# spacing carries no timing information. The IntelliVue sends each wave in
+# frames of FRAME_PERIOD_S (1.024 s) of signal with a stable row count (ECG 768,
+# Pleth 128, Resp 64 on the MP50), so a 1-second bucket holds one frame and the
+# row rate is frame rows / 1.024 (ECG 750/s, Pleth 125/s, Resp 62.5/s). Loss is
+# measured against that rate x active span; counting the frame rows per second
+# instead read a complete recording as 97.6%. The 1.024 s cadence also leaves
+# one 1-second bucket empty about every 42 s, so a gap is two or more empty
+# seconds; shorter losses still show in completeness. Numerics get plain counts
+# only — many are intermittent by design (NIBP only on inflation), so
+# "expected" would be meaningless.
+
+FRAME_PERIOD_S = 1.024
 
 QUALITY_WAVE_SQL = """
 WITH b AS (
@@ -1140,34 +1147,42 @@ WITH b AS (
 SELECT physio_id,
        sum(n)::bigint                                     AS samples,
        count(*)::bigint                                   AS seconds_with_data,
-       -- 90th percentile of per-second counts: equals the nominal rate for any
-       -- normal capture (most seconds are full) but, unlike mode(), is not thrown
-       -- off by partial-second counts dominating a very short capture.
+       -- 90th percentile of per-second counts: the rows of one frame for any
+       -- normal capture (most seconds hold one full frame) but, unlike mode(),
+       -- is not thrown off by partial-second counts dominating a very short
+       -- capture. Rows per second as the EDF lays them out (its spr); the
+       -- quality report divides it by FRAME_PERIOD_S for the true row rate.
        percentile_disc(0.9) WITHIN GROUP (ORDER BY n)     AS rate_hz,
        min(sec)                                           AS first_sec,
        max(sec)                                           AS last_sec,
-       count(*) FILTER (WHERE step > 1)                   AS gap_count,
-       COALESCE(max(step) FILTER (WHERE step > 1) - 1, 0) AS longest_gap_s
+       count(*) FILTER (WHERE step > 2)                   AS gap_count,
+       COALESCE(max(step) FILTER (WHERE step > 2) - 1, 0) AS longest_gap_s
 FROM g GROUP BY physio_id ORDER BY physio_id
 """
 
+def _wave_quality(r) -> dict[str, Any]:
+    """One QUALITY_WAVE_SQL row -> the waveform entry of the quality report."""
+    span_s = int((r["last_sec"] - r["first_sec"]).total_seconds()) + 1
+    frame_rows = int(r["rate_hz"])
+    rate = frame_rows / FRAME_PERIOD_S
+    expected = round(rate * span_s)
+    samples = int(r["samples"])
+    return {
+        "physio_id": r["physio_id"],
+        "rate_hz": round(rate, 2),
+        "frame_rows": frame_rows,
+        "samples": samples,
+        "expected_samples": expected,
+        "missing_samples": max(0, expected - samples),
+        "completeness_pct": round(min(100.0, 100.0 * samples / expected), 2) if expected else None,
+        "gap_count": int(r["gap_count"]),
+        "longest_gap_s": float(r["longest_gap_s"]),
+        "first_sample": r["first_sec"].timestamp(),
+        "last_sample": r["last_sec"].timestamp() + 1,
+    }
+
 async def _compute_quality(conn, started_at, end) -> dict[str, Any]:
-    waves = []
-    for r in await conn.fetch(QUALITY_WAVE_SQL, started_at, end):
-        span_s = int((r["last_sec"] - r["first_sec"]).total_seconds()) + 1
-        expected = int(r["rate_hz"]) * span_s
-        waves.append({
-            "physio_id": r["physio_id"],
-            "rate_hz": int(r["rate_hz"]),
-            "samples": int(r["samples"]),
-            "expected_samples": expected,
-            "missing_samples": max(0, expected - int(r["samples"])),
-            "completeness_pct": round(min(100.0, 100.0 * int(r["samples"]) / expected), 2) if expected else None,
-            "gap_count": int(r["gap_count"]),
-            "longest_gap_s": float(r["longest_gap_s"]),
-            "first_sample": r["first_sec"].timestamp(),
-            "last_sample": r["last_sec"].timestamp() + 1,
-        })
+    waves = [_wave_quality(r) for r in await conn.fetch(QUALITY_WAVE_SQL, started_at, end)]
     nums = await conn.fetch(
         "SELECT physio_id, count(*) AS samples, min(time) AS first, max(time) AS last "
         "FROM patient_numerics WHERE time BETWEEN $1 AND $2 GROUP BY physio_id ORDER BY physio_id",
