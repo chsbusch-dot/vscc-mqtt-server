@@ -14,6 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY vscc-websocket-streamer.py .
 
 ENV VSC_FILE_PATH=/data/DataExportVSC.json
+# print() straight to docker logs (no stdout buffering)
+ENV PYTHONUNBUFFERED=1
 VOLUME /data
 
 # The script self-hosts uvicorn (hyphenated filename is not importable as a module)
