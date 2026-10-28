@@ -5,10 +5,11 @@ import re
 import shutil
 import tempfile
 from array import array
+from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from zoneinfo import ZoneInfo
 
 import aiofiles
@@ -1150,8 +1151,8 @@ SELECT physio_id,
        -- 90th percentile of per-second counts: the rows of one frame for any
        -- normal capture (most seconds hold one full frame) but, unlike mode(),
        -- is not thrown off by partial-second counts dominating a very short
-       -- capture. Rows per second as the EDF lays them out (its spr); the
-       -- quality report divides it by FRAME_PERIOD_S for the true row rate.
+       -- capture. The quality report divides it by FRAME_PERIOD_S for the
+       -- row rate (ECG rows include the copy rows the EDF export drops).
        percentile_disc(0.9) WITHIN GROUP (ORDER BY n)     AS rate_hz,
        min(sec)                                           AS first_sec,
        max(sec)                                           AS last_sec,
@@ -1205,16 +1206,29 @@ async def session_quality(session_id: int):
 
 # --- 7. EDF export ---
 #
-# One EDF channel per waveform signal. Because timestamps are frame-stamped
-# (see section 6), samples are placed on a per-second grid at the signal's
-# nominal rate: each second's samples fill that second's slot in arrival
-# order, short seconds are zero-padded, empty seconds stay zero — so channel
-# alignment never drifts and gaps are preserved in place. Values are scaled
-# symmetrically (digital 0 == physical 0) so the zero gap-filler is honest.
-# Channels stream from DB cursors into sparse temp files, then interleave
-# into EDF records — memory stays flat for GB sessions.
+# One EDF channel per waveform signal and one EDF record per monitor frame.
+# The IntelliVue sends each wave as a burst of rows about every 1.024 s (see
+# section 6), stamped on arrival, so the record duration is the frame period
+# measured over the session (stamp span / frames), written to the precision
+# the 8-char header field allows, and the header rate (samples per record /
+# duration) is the true sample rate. Frames go down in arrival order, one per
+# record: stamps jitter by tens of ms and single frames arrive up to 0.7 s
+# late, so a frame only skips a record when the frames after it agree that
+# one is missing (the all-zero record then keeps the gap in place). A short
+# frame is zero-padded to the record. In each 192-row ECG block, counted from
+# the burst start, the first 64 rows are a 250 Hz copy of the 128 real 500 Hz
+# rows that follow; they are dropped, so the ECG channel holds real samples
+# only (512 per frame, about 499.8 Hz). Values are scaled symmetrically
+# (digital 0 == physical 0) so the zero filler is honest. Channels stream from
+# DB cursors into temp files, then interleave into EDF records, so memory
+# stays flat for GB sessions. The export stats (period, rates, copy rows
+# dropped, padded samples, all-zero records) also land in waveforms.edf.json.
 
 EDF_DIG_MAX = 32767
+EDF_BURST_GAP_S = 0.3   # a stamp step above this starts a new frame burst
+EDF_LOOKAHEAD = 5       # frames a missing-frame check looks at
+ECG_BLOCK_ROWS = 192    # one 256 ms ECG block: 64 copy rows (250 Hz), then 128 real rows (500 Hz)
+ECG_COPY_ROWS = 64
 
 def _edf_ascii(value, width: int) -> bytes:
     """Fixed-width space-padded ASCII header field."""
@@ -1229,36 +1243,210 @@ def _edf_num(value: float, width: int) -> bytes:
             return s.ljust(width).encode("ascii")
     return f"{value:.1e}"[:width].ljust(width).encode("ascii")
 
-def _edf_flush_second(f, sec_idx: int | None, n_records: int, spr: int, buf: list[int]):
-    if sec_idx is None or not (0 <= sec_idx < n_records):
-        return
-    vals = (buf + [0] * spr)[:spr]  # pad short seconds, trim overfull ones
-    f.seek(sec_idx * spr * 2)
-    f.write(array("h", vals).tobytes())
+def _edf_duration(period: float) -> str:
+    """Record duration for the 8-char header field, with as many decimals as fit."""
+    for d in range(6, 0, -1):
+        s = f"{period:.{d}f}"
+        if len(s) <= 8:
+            return s
+    return f"{period:.0f}"
+
+def _edf_real_rows(n: int, ecg: bool) -> int:
+    """Samples kept from the first n rows of a burst (ECG loses each block's copy rows)."""
+    if not ecg:
+        return n
+    return n // ECG_BLOCK_ROWS * (ECG_BLOCK_ROWS - ECG_COPY_ROWS) + max(0, n % ECG_BLOCK_ROWS - ECG_COPY_ROWS)
+
+class _EdfChannel:
+    """One waveform on its way into the EDF. Rows arrive in time order; the kept
+    samples go to a temp file as int16, and each burst's first stamp and row
+    count are kept to lay the frames out once the channel is complete."""
+
+    def __init__(self, physio_id: str, pabs: float, f: BinaryIO):
+        self.physio_id = physio_id
+        self.pabs = pabs
+        self.scale = EDF_DIG_MAX / pabs
+        self.ecg = physio_id.startswith("NOM_ECG_ELEC_POTL")
+        self.f = f
+        self.buf = array("h")
+        self.starts: list[float] = []
+        self.rows: list[int] = []
+        self.last: float | None = None
+        self.copy_rows = 0
+
+    def add(self, t: float, value: float) -> None:
+        if self.last is None or t - self.last > EDF_BURST_GAP_S:
+            self.starts.append(t)
+            self.rows.append(0)
+        self.last = t
+        i = self.rows[-1]
+        self.rows[-1] = i + 1
+        if self.ecg and i % ECG_BLOCK_ROWS < ECG_COPY_ROWS:
+            self.copy_rows += 1
+            return
+        v = int(round(value * self.scale))
+        self.buf.append(max(-EDF_DIG_MAX, min(EDF_DIG_MAX, v)))
+        if len(self.buf) >= 1 << 16:
+            self.flush()
+
+    def flush(self) -> None:
+        self.f.write(self.buf.tobytes())
+        self.buf = array("h")
+
+    def frames(self) -> tuple[int, list[float | None], list[int]]:
+        """(rows per frame, stamp per frame, samples per frame). Rows per frame is
+        the commonest burst size (ties to the larger); a longer burst, two frames
+        that arrived less than EDF_BURST_GAP_S apart, is cut into frames of that
+        size, the later ones unstamped so they follow straight on."""
+        sizes = Counter(self.rows)
+        frame_rows = max(sizes, key=lambda n: (sizes[n], n))
+        stamps: list[float | None] = []
+        counts: list[int] = []
+        for s, n in zip(self.starts, self.rows, strict=True):
+            for a in range(0, n, frame_rows):
+                b = min(n, a + frame_rows)
+                stamps.append(s if a == 0 else None)
+                counts.append(_edf_real_rows(b, self.ecg) - _edf_real_rows(a, self.ecg))
+        return frame_rows, stamps, counts
+
+def _edf_place(stamps: list[float | None], r0: int, period: float) -> list[int]:
+    """Record index of each frame, the first at r0. Frames take one record each,
+    in order. A stamped frame skips records only when it and the frames after it
+    all sit more than half a period behind the least-delayed of the frames before
+    it (minimums over EDF_LOOKAHEAD frames each way), so a late arrival moves
+    nothing while a lost frame leaves its record empty. Anchoring on the recent
+    frames, not one grid from the first stamp, keeps a slightly-off period from
+    adding up to phantom gaps over hours."""
+    recs: list[int] = []
+    base: list[float] = []   # stamp - record * period of each stamped frame so far
+    r = r0 - 1
+    for k, s in enumerate(stamps):
+        r += 1
+        if s is not None:
+            if base:
+                ref = min(base[-EDF_LOOKAHEAD:])
+                late = min(x - ref - (r + j) * period
+                           for j, x in enumerate(stamps[k:k + EDF_LOOKAHEAD]) if x is not None)
+                if late > period / 2:
+                    r += round(late / period)
+            base.append(s - r * period)
+        recs.append(r)
+    return recs
+
+def _edf_layout(stamps: list[list[float | None]]) -> tuple[float, float, list[list[int]]]:
+    """(first frame stamp, frame period, record index per frame) for all channels.
+    The period is the stamp span over the record span, pooled over the channels
+    and refitted from the placement until that settles; the final placement uses
+    the period as the header writes it."""
+    firsts = [st[0] for st in stamps]   # a channel's first frame always starts a burst
+    t0 = min(s for s in firsts if s is not None)
+
+    def place(period: float) -> list[list[int]]:
+        return [_edf_place(st, round(((s or t0) - t0) / period), period)
+                for st, s in zip(stamps, firsts, strict=True)]
+
+    def fit(recs: list[list[int]]) -> float:
+        span = steps = 0.0
+        for st, rc in zip(stamps, recs, strict=True):
+            k = max(i for i, s in enumerate(st) if s is not None)
+            span += (st[k] or 0.0) - (st[0] or 0.0)
+            steps += rc[k] - rc[0]
+        return span / steps if steps else FRAME_PERIOD_S
+
+    period = FRAME_PERIOD_S
+    recs = place(period)
+    for _ in range(5):
+        period = fit(recs)
+        placed = place(period)
+        if placed == recs:
+            break
+        recs = placed
+    return t0, period, place(float(_edf_duration(period)))
+
+def _edf_label(physio_id: str) -> str:
+    return physio_id[4:] if physio_id.startswith("NOM_") else physio_id
+
+def _edf_write(o: BinaryIO, chans: list[_EdfChannel], patient: str, recording: str) -> dict[str, Any]:
+    """Lay the channels' frames onto records and write the EDF to o. Every channel
+    must be flushed. Returns the export stats."""
+    layouts = [c.frames() for c in chans]
+    t0, period, recs = _edf_layout([st for _, st, _ in layouts])
+    dur_s = _edf_duration(period)
+    dur = float(dur_s)
+    sprs = [max(1, _edf_real_rows(fr, c.ecg)) for c, (fr, _, _) in zip(chans, layouts, strict=True)]
+    n_records = max(rc[-1] for rc in recs) + 1
+    start = datetime.fromtimestamp(t0, UTC)
+    ns = len(chans)
+
+    o.write(_edf_ascii("0", 8))                                       # version
+    o.write(_edf_ascii(patient, 80))                                  # patient (anonymous)
+    o.write(_edf_ascii(recording, 80))
+    o.write(_edf_ascii(start.strftime("%d.%m.%y"), 8))                # to the second: plain EDF has
+    o.write(_edf_ascii(start.strftime("%H.%M.%S"), 8))                # no finer start (start_utc is exact)
+    o.write(_edf_ascii(256 * (ns + 1), 8))                            # header bytes
+    o.write(_edf_ascii("", 44))                                       # reserved (plain EDF)
+    o.write(_edf_ascii(n_records, 8))
+    o.write(_edf_ascii(dur_s, 8))                                     # record duration, s
+    o.write(_edf_ascii(ns, 4))
+    for c in chans: o.write(_edf_ascii(_edf_label(c.physio_id), 16))
+    for _c in chans: o.write(_edf_ascii("", 80))                       # transducer
+    for _c in chans: o.write(_edf_ascii("", 8))                        # physical dimension (monitor units)
+    for c in chans: o.write(_edf_num(-c.pabs, 8))
+    for c in chans: o.write(_edf_num(c.pabs, 8))
+    for _c in chans: o.write(_edf_ascii(-EDF_DIG_MAX, 8))
+    for _c in chans: o.write(_edf_ascii(EDF_DIG_MAX, 8))
+    for _c in chans: o.write(_edf_ascii("", 80))                       # prefiltering
+    for spr in sprs: o.write(_edf_ascii(spr, 8))
+    for _c in chans: o.write(_edf_ascii("", 32))                       # reserved
+
+    for c in chans:
+        c.f.seek(0)
+    nxt = [0] * ns
+    for rec in range(n_records):
+        for i, c in enumerate(chans):
+            k, spr = nxt[i], sprs[i]
+            if k < len(recs[i]) and recs[i][k] == rec:
+                n = layouts[i][2][k]
+                o.write(c.f.read(2 * n))
+                o.write(bytes(2 * (spr - n)))
+                nxt[i] = k + 1
+            else:
+                o.write(bytes(2 * spr))
+
+    stats = []
+    for c, (frame_rows, _, counts), rc, spr in zip(chans, layouts, recs, sprs, strict=True):
+        samples, frames = sum(counts), len(counts)
+        stats.append({
+            "physio_id": c.physio_id,
+            "label": _edf_label(c.physio_id),
+            "rate_hz": round(spr / dur, 3),
+            "samples_per_record": spr,
+            "frame_rows": frame_rows,
+            "source_rows": sum(c.rows),
+            "copy_rows_dropped": c.copy_rows,
+            "samples": samples,
+            "padded_samples": frames * spr - samples,
+            "flat_records": n_records - frames,
+            "missing_frames": rc[-1] - rc[0] + 1 - frames,
+            "frames": frames,
+        })
+    return {"n_records": n_records, "start_utc": start.isoformat(), "record_duration_s": dur,
+            "frame_period_s": round(period, 7), "channels": stats}
 
 async def _export_session_edf(session_id: int) -> dict[str, Any]:
-    """Build <package>/waveforms.edf, regenerated fresh on every call."""
+    """Build <package>/waveforms.edf and its waveforms.edf.json stats, regenerated
+    fresh on every call."""
     async with db_pool.acquire() as conn:
         r = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", session_id)
         if not r:
             return {"ok": False, "error": "not found"}
         end = r["ended_at"] or datetime.now(UTC)
-
-        chans = []
-        for q in await conn.fetch(QUALITY_WAVE_SQL, r["started_at"], end):
-            lim = await conn.fetchrow(
-                "SELECT min(value) AS vmin, max(value) AS vmax FROM patient_waveforms "
-                "WHERE physio_id = $1 AND time BETWEEN $2 AND $3",
-                q["physio_id"], r["started_at"], end)
-            pabs = max(abs(lim["vmin"]), abs(lim["vmax"]), 1e-9)
-            chans.append({"physio_id": q["physio_id"], "spr": int(q["rate_hz"]),
-                          "first_sec": q["first_sec"], "last_sec": q["last_sec"], "pabs": pabs})
-        if not chans:
+        lims = await conn.fetch(
+            "SELECT physio_id, min(value) AS vmin, max(value) AS vmax FROM patient_waveforms "
+            "WHERE time BETWEEN $1 AND $2 GROUP BY physio_id ORDER BY physio_id",
+            r["started_at"], end)
+        if not lims:
             return {"ok": False, "error": "session has no waveform data"}
-
-        t0 = min(c["first_sec"] for c in chans)
-        t0_epoch = int(t0.timestamp())
-        n_records = int(max(c["last_sec"] for c in chans).timestamp()) - t0_epoch + 1
 
         out = _session_package_dir(r)
         out.mkdir(parents=True, exist_ok=True)
@@ -1266,12 +1454,12 @@ async def _export_session_edf(session_id: int) -> dict[str, Any]:
 
         SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=str(SESSIONS_DIR)) as tmpdir:
-            for i, ch in enumerate(chans):
-                scale = EDF_DIG_MAX / ch["pabs"]
-                ch["tmp"] = Path(tmpdir) / f"ch{i}.raw"
-                with open(ch["tmp"], "wb") as f:
-                    f.truncate(n_records * ch["spr"] * 2)  # sparse: unwritten == digital 0 == physical 0
-                    sec_idx, buf = None, []
+            chans: list[_EdfChannel] = []
+            try:
+                for i, q in enumerate(lims):
+                    pabs = max(abs(q["vmin"]), abs(q["vmax"]), 1e-9)
+                    ch = _EdfChannel(q["physio_id"], pabs, open(Path(tmpdir) / f"ch{i}.raw", "w+b"))
+                    chans.append(ch)
                     async with conn.transaction():
                         # A whole VSCapture frame shares one millisecond stamp, so
                         # ORDER BY time alone leaves intra-frame sample order to the
@@ -1280,51 +1468,17 @@ async def _export_session_edf(session_id: int) -> dict[str, Any]:
                         async for x in conn.cursor(
                                 "SELECT time, value FROM patient_waveforms "
                                 "WHERE physio_id = $1 AND time BETWEEN $2 AND $3 ORDER BY time, ctid",
-                                ch["physio_id"], r["started_at"], end, prefetch=EXPORT_BATCH):
-                            idx = int(x["time"].timestamp()) - t0_epoch
-                            if idx != sec_idx:
-                                _edf_flush_second(f, sec_idx, n_records, ch["spr"], buf)
-                                sec_idx, buf = idx, []
-                            v = int(round(x["value"] * scale))
-                            buf.append(max(-EDF_DIG_MAX, min(EDF_DIG_MAX, v)))
-                    _edf_flush_second(f, sec_idx, n_records, ch["spr"], buf)
-
-            ns = len(chans)
-            with open(edf_path, "wb") as o:
-                o.write(_edf_ascii("0", 8))                                       # version
-                o.write(_edf_ascii(r["subject_code"] or "X", 80))                 # patient (anonymous)
-                o.write(_edf_ascii(f"VSCC session {r['id']} (times UTC) {r['label']}", 80))
-                o.write(_edf_ascii(t0.strftime("%d.%m.%y"), 8))
-                o.write(_edf_ascii(t0.strftime("%H.%M.%S"), 8))
-                o.write(_edf_ascii(256 * (ns + 1), 8))                            # header bytes
-                o.write(_edf_ascii("", 44))                                       # reserved (plain EDF)
-                o.write(_edf_ascii(n_records, 8))
-                o.write(_edf_ascii(1, 8))                                         # record duration, s
-                o.write(_edf_ascii(ns, 4))
-                for c in chans:
-                    pid = c["physio_id"]
-                    o.write(_edf_ascii(pid[4:] if pid.startswith("NOM_") else pid, 16))
-                for _c in chans: o.write(_edf_ascii("", 80))                       # transducer
-                for _c in chans: o.write(_edf_ascii("", 8))                        # physical dimension (monitor units)
-                for c in chans: o.write(_edf_num(-c["pabs"], 8))
-                for c in chans: o.write(_edf_num(c["pabs"], 8))
-                for _c in chans: o.write(_edf_ascii(-EDF_DIG_MAX, 8))
-                for _c in chans: o.write(_edf_ascii(EDF_DIG_MAX, 8))
-                for _c in chans: o.write(_edf_ascii("", 80))                       # prefiltering
-                for c in chans: o.write(_edf_ascii(c["spr"], 8))
-                for _c in chans: o.write(_edf_ascii("", 32))                       # reserved
-                handles = [open(c["tmp"], "rb") for c in chans]
-                try:
-                    for _ in range(n_records):
-                        for h, c in zip(handles, chans, strict=True):
-                            o.write(h.read(c["spr"] * 2))
-                finally:
-                    for h in handles:
-                        h.close()
-
-    return {"ok": True, "path": str(edf_path), "n_records": n_records,
-            "start_utc": t0.isoformat(),
-            "channels": [{"physio_id": c["physio_id"], "rate_hz": c["spr"]} for c in chans]}
+                                ch.physio_id, r["started_at"], end, prefetch=EXPORT_BATCH):
+                            ch.add(x["time"].timestamp(), x["value"])
+                    ch.flush()
+                with open(edf_path, "wb") as o:
+                    stats = _edf_write(o, chans, r["subject_code"] or "X",
+                                       f"VSCC session {r['id']} (times UTC) {r['label']}")
+            finally:
+                for ch in chans:
+                    ch.f.close()
+    (out / "waveforms.edf.json").write_text(json.dumps(stats, indent=2))
+    return {"ok": True, "path": str(edf_path), **stats}
 
 @app.get("/api/sessions/{session_id}/edf")
 async def download_session_edf(session_id: int):
