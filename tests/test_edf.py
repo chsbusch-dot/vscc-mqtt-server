@@ -1,11 +1,13 @@
 """EDF export (worker section 7): one record per monitor frame at the measured
-frame period, the ECG's 250 Hz copy rows dropped, short frames padded and lost
-frames left as all-zero records.
+frame period, the ECG's 250 Hz copy rows dropped where a burst still holds them,
+short frames padded and lost frames left as all-zero records.
 
 The fixtures mimic the MP50 capture: a frame of rows about every 1.024 s (ECG
 768, pleth 128, resp 64), each 192-row ECG block a 64-row copy of its 128 real
-samples at 250 Hz followed by the 128. The EDF is read back with a plain header
-parse and, where installed, pyedflib.
+samples at 250 Hz followed by the 128. Since WOR-976 the tailer drops the copies
+at ingest, so newer ECG frames hold the 512 real samples only, and the export
+tells the two apart per burst. The EDF is read back with a plain header parse
+and, where installed, pyedflib.
 """
 
 import io
@@ -33,32 +35,36 @@ def _val(n: int) -> float:
     return (n % 800) / 1000 - 0.4
 
 
-def _ecg_frame(n0: int, n_rows: int) -> tuple[list[float], list[float]]:
+def _ecg_frame(n0: int, n_rows: int, free: bool = False) -> tuple[list[float], list[float]]:
     """The first n_rows capture rows of an ECG frame whose real samples start at
-    index n0, and the real samples among them."""
+    index n0, and the real samples among them. A copy-free frame (stored since
+    WOR-976) is the real samples alone."""
     rows: list[float] = []
     for b in range(4):
         real = [_val(n0 + 128 * b + i) for i in range(128)]
-        rows += real[::2] + real
+        rows += real if free else real[::2] + real
     rows = rows[:n_rows]
-    return rows, [v for i, v in enumerate(rows) if i % 192 >= 64]
+    return rows, rows if free else [v for i, v in enumerate(rows) if i % 192 >= 64]
 
 
 def _session(n: int, stamp: Callable[[int], float],
-             rows: Callable[[str, int], int] = lambda pid, k: FRAME_ROWS[pid],
-             channels: tuple[str, ...] = (ECG, PLETH, RESP)) -> tuple[Feed, dict[str, list[int]]]:
-    """n frames, frame k stamped stamp(k) with rows(pid, k) rows (0 = lost).
-    Returns the capture rows per channel and the EDF samples each channel should
-    hold, record k for frame k."""
+             rows: Callable[[str, int], int] | None = None,
+             channels: tuple[str, ...] = (ECG, PLETH, RESP),
+             free: Callable[[int], bool] = lambda k: False) -> tuple[Feed, dict[str, list[int]]]:
+    """n frames, frame k stamped stamp(k) with rows(pid, k) rows (0 = lost), a
+    full frame by default; ECG frame k is copy-free where free(k). Returns the
+    capture rows per channel and the EDF samples each channel should hold,
+    record k for frame k."""
     feed: Feed = {pid: [] for pid in channels}
     want: dict[str, list[int]] = {pid: [] for pid in channels}
     for pid in channels:
         n0 = 0
         for k in range(n):
-            m = rows(pid, k)
+            cf = pid == ECG and free(k)
+            m = rows(pid, k) if rows else (SPR[pid] if cf else FRAME_ROWS[pid])
             if m:
                 if pid == ECG:
-                    r, real = _ecg_frame(n0, m)
+                    r, real = _ecg_frame(n0, m, cf)
                 else:
                     r = real = [_val(n0 + i) for i in range(m)]
                 feed[pid].append((stamp(k), r))
@@ -120,13 +126,24 @@ def _check_counts(stats: dict[str, Any], sig: dict[str, list[int]]) -> None:
 
 # --- helpers -------------------------------------------------------------------
 
-def test_edf_real_rows() -> None:
-    assert w._edf_real_rows(768, True) == 512
-    assert w._edf_real_rows(767, True) == 511
-    assert w._edf_real_rows(384, True) == 256
-    assert w._edf_real_rows(64, True) == 0
-    assert w._edf_real_rows(100, True) == 36
-    assert w._edf_real_rows(128, False) == 128
+def _kept(sizes: list[int], pid: str = ECG) -> tuple[list[int], int]:
+    """Samples kept per burst, and copy rows dropped, for bursts of these sizes."""
+    ch = w._EdfChannel(pid, 1.0, io.BytesIO())
+    for k, n in enumerate(sizes):
+        for j in range(n):
+            ch.add(T0 + k * P + 0.001 * (j * 4 // n), 0.0)
+    ch.flush()
+    return ch.kept, ch.copy_rows
+
+
+def test_ecg_copies_told_apart_per_burst() -> None:
+    # 768 rows = copies, 512 = copy-free; a burst of any other size follows the
+    # last full one, and those before the first full one wait for it.
+    assert _kept([192, 768, 767, 384, 64, 100]) == ([128, 512, 511, 256, 0, 36], 832)
+    assert _kept([384, 512, 767, 768, 384]) == ([384, 512, 767, 512, 256], 384)
+    assert _kept([128, 100, 128], PLETH) == ([128, 100, 128], 0)
+    # No full burst within EDF_ECG_HOLD rows: the held ones go out copy-free.
+    assert _kept([100] * 700) == ([100] * 700, 0)
 
 
 def test_edf_duration_fills_the_8_char_field() -> None:
@@ -156,6 +173,49 @@ def test_ecg_copy_rows_dropped_at_true_rate(tmp_path: Path) -> None:
     assert pleth["copy_rows_dropped"] == 0
     assert ecg["rate_hz"] == round(512 / 1.0244, 3)
     assert stats["record_duration_s"] == 1.0244
+    _check_counts(stats, sig)
+
+
+def test_copy_free_ecg_keeps_every_sample(tmp_path: Path) -> None:
+    # ECG stored since WOR-976: 512 real rows per frame, nothing to drop.
+    feed, want = _session(10, lambda k: T0 + k * P, channels=(ECG, PLETH), free=lambda k: True)
+    path, stats = _export(tmp_path, feed)
+    head, sig = _parse(path)
+
+    assert head["n_records"] == 10
+    assert head["spr"] == [512, 128]
+    assert sig == {_label(pid): v for pid, v in want.items()}
+
+    ecg = stats["channels"][0]
+    assert (ecg["source_rows"], ecg["copy_rows_dropped"], ecg["samples"]) == (5120, 0, 5120)
+    assert ecg["frame_rows"] == 512
+    assert ecg["rate_hz"] == round(512 / 1.0244, 3)
+    _check_counts(stats, sig)
+
+
+def test_mixed_session_and_partial_bursts(tmp_path: Path) -> None:
+    # Frames 0..5 stored with copies, 6..11 copy-free. Frame 0 is one block (it
+    # waits for frame 1 to tell its class), frame 3 is half a copy frame and
+    # frame 9 half a copy-free one.
+    def rows(pid: str, k: int) -> int:
+        if pid != ECG:
+            return FRAME_ROWS[pid]
+        return {0: 192, 3: 384, 9: 256}.get(k, 768 if k < 6 else 512)
+
+    feed, want = _session(12, lambda k: T0 + k * P, rows, free=lambda k: k >= 6)
+    path, stats = _export(tmp_path, feed)
+    head, sig = _parse(path)
+
+    assert head["n_records"] == 12
+    assert head["spr"] == [512, 128, 64]
+    assert sig == {_label(pid): v for pid, v in want.items()}
+
+    ecg = stats["channels"][0]
+    assert ecg["source_rows"] == 6464
+    assert ecg["copy_rows_dropped"] == 64 + 2 * 256 + 128 + 2 * 256
+    assert ecg["samples"] == 5248
+    assert ecg["padded_samples"] == 384 + 256 + 256
+    assert (ecg["flat_records"], ecg["missing_frames"]) == (0, 0)
     _check_counts(stats, sig)
 
 
