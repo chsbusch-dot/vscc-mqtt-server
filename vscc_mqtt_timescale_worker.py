@@ -61,6 +61,15 @@ WAVE_TOPIC_ALIASES = {
     "NOM_RESP": "HF-RESP",
 }
 
+# ECG waves (every lead, NOM_ECG_ELEC_POTL_*) come in 192-row blocks, one per
+# 256 ms: 64 rows of the same lead at 250 Hz about 32 ms early (a redundant
+# copy), then the 128 real 500 Hz samples. CSV column 1 is a block counter
+# (+2048 per block, constant within it), so the tailer drops the copies at
+# ingest and the DB, MQTT and every export hold real samples only (WOR-976).
+ECG_PREFIX = "NOM_ECG_ELEC_POTL"
+ECG_BLOCK_ROWS = 192
+ECG_COPY_ROWS = 64
+
 
 def physio_id_from_wave_file(path: Path) -> str:
     """NOM_PLETHWaveExport.csv -> NOM_PLETH"""
@@ -198,6 +207,7 @@ async def batch_inserter():
 # --- 2. The Generic Async File Tailer ---
 async def tail_file(config: dict[str, Any], client: aiomqtt.Client):
     file_path, file_type, topic = config["path"], config["type"], config["topic"]
+    ecg = file_type == "csv" and (config["physio_id"] or "").startswith(ECG_PREFIX)
     print(f"Waiting for file: {file_path}...")
     while not file_path.exists() or not file_path.is_file(): await asyncio.sleep(1)
     print(f"File found: {file_path}. Tailing live data for topic {topic}...")
@@ -219,6 +229,9 @@ async def tail_file(config: dict[str, Any], client: aiomqtt.Client):
                 # module-global `last_data_time` (UTC datetime, which drives
                 # sessions/capture-state). Distinct name so the two never cross.
                 last_read_monotonic = loop.time()
+                # ECG block state, fresh on every (re)open: the block this open
+                # joins mid-way is dropped whole, its copy rows can't be told apart.
+                blk_id, blk_ok, blk_i = None, False, 0
 
                 while True:
                     line = await f.readline()
@@ -279,6 +292,10 @@ async def tail_file(config: dict[str, Any], client: aiomqtt.Client):
                         try:
                             parts = line.split(',')
                             if len(parts) < 4: continue
+                            if ecg:  # keep rows 65..192 of each col1 block, from the first full block on
+                                if parts[1] != blk_id: blk_ok, blk_id, blk_i = blk_id is not None, parts[1], 0
+                                blk_i += 1
+                                if not blk_ok or blk_i <= ECG_COPY_ROWS: continue
                             parsed_time = parse_vsc_timestamp(parts[2])
                             if not parsed_time: continue
                             try: value_float = float(parts[3])
@@ -1215,10 +1232,12 @@ async def session_quality(session_id: int):
 # record: stamps jitter by tens of ms and single frames arrive up to 0.7 s
 # late, so a frame only skips a record when the frames after it agree that
 # one is missing (the all-zero record then keeps the gap in place). A short
-# frame is zero-padded to the record. In each 192-row ECG block, counted from
-# the burst start, the first 64 rows are a 250 Hz copy of the 128 real 500 Hz
-# rows that follow; they are dropped, so the ECG channel holds real samples
-# only (512 per frame, about 499.8 Hz). Values are scaled symmetrically
+# frame is zero-padded to the record. The tailer drops the ECG copy rows (see
+# ECG_BLOCK_ROWS) at ingest since WOR-976, but older data still holds them:
+# each ECG burst is classed by its size (768 rows with copies, 512 without)
+# and only in a burst with copies are rows 0..63 of each 192-row block,
+# counted from the burst start, dropped. Either way the ECG channel holds real
+# samples only (512 per frame, about 499.8 Hz). Values are scaled symmetrically
 # (digital 0 == physical 0) so the zero filler is honest. Channels stream from
 # DB cursors into temp files, then interleave into EDF records, so memory
 # stays flat for GB sessions. The export stats (period, rates, copy rows
@@ -1227,8 +1246,9 @@ async def session_quality(session_id: int):
 EDF_DIG_MAX = 32767
 EDF_BURST_GAP_S = 0.3   # a stamp step above this starts a new frame burst
 EDF_LOOKAHEAD = 5       # frames a missing-frame check looks at
-ECG_BLOCK_ROWS = 192    # one 256 ms ECG block: 64 copy rows (250 Hz), then 128 real rows (500 Hz)
-ECG_COPY_ROWS = 64
+EDF_ECG_COPY_FRAME = 4 * ECG_BLOCK_ROWS                     # 768 rows: an ECG frame stored with its copy rows
+EDF_ECG_REAL_FRAME = 4 * (ECG_BLOCK_ROWS - ECG_COPY_ROWS)   # 512: one stored copy-free (since WOR-976)
+EDF_ECG_HOLD = 1 << 16  # ECG rows held back while no full burst has told copies from copy-free
 
 def _edf_ascii(value, width: int) -> bytes:
     """Fixed-width space-padded ASCII header field."""
@@ -1251,63 +1271,85 @@ def _edf_duration(period: float) -> str:
             return s
     return f"{period:.0f}"
 
-def _edf_real_rows(n: int, ecg: bool) -> int:
-    """Samples kept from the first n rows of a burst (ECG loses each block's copy rows)."""
-    if not ecg:
-        return n
-    return n // ECG_BLOCK_ROWS * (ECG_BLOCK_ROWS - ECG_COPY_ROWS) + max(0, n % ECG_BLOCK_ROWS - ECG_COPY_ROWS)
-
 class _EdfChannel:
-    """One waveform on its way into the EDF. Rows arrive in time order; the kept
-    samples go to a temp file as int16, and each burst's first stamp and row
-    count are kept to lay the frames out once the channel is complete."""
+    """One waveform on its way into the EDF. Rows arrive in time order and are
+    held a burst at a time; each closed burst's kept samples go to a temp file
+    as int16, and its first stamp, row count and kept count are kept to lay the
+    frames out once the channel is complete. An ECG burst of EDF_ECG_COPY_FRAME
+    rows still carries the copy rows (stored before WOR-976), one of
+    EDF_ECG_REAL_FRAME rows is copy-free; a burst of any other size follows the
+    last full burst, and those before the first full one wait for it (copy-free
+    if none comes within EDF_ECG_HOLD rows)."""
 
     def __init__(self, physio_id: str, pabs: float, f: BinaryIO):
         self.physio_id = physio_id
         self.pabs = pabs
         self.scale = EDF_DIG_MAX / pabs
-        self.ecg = physio_id.startswith("NOM_ECG_ELEC_POTL")
+        self.ecg = physio_id.startswith(ECG_PREFIX)
         self.f = f
         self.buf = array("h")
+        self.burst = array("h")
+        self.pending: list[array] = []
+        self.copies: bool | None = None
         self.starts: list[float] = []
         self.rows: list[int] = []
+        self.kept: list[int] = []
         self.last: float | None = None
         self.copy_rows = 0
 
     def add(self, t: float, value: float) -> None:
         if self.last is None or t - self.last > EDF_BURST_GAP_S:
+            self._close()
             self.starts.append(t)
             self.rows.append(0)
         self.last = t
-        i = self.rows[-1]
-        self.rows[-1] = i + 1
-        if self.ecg and i % ECG_BLOCK_ROWS < ECG_COPY_ROWS:
-            self.copy_rows += 1
-            return
+        self.rows[-1] += 1
         v = int(round(value * self.scale))
-        self.buf.append(max(-EDF_DIG_MAX, min(EDF_DIG_MAX, v)))
-        if len(self.buf) >= 1 << 16:
-            self.flush()
+        self.burst.append(max(-EDF_DIG_MAX, min(EDF_DIG_MAX, v)))
+
+    def _close(self, final: bool = False) -> None:
+        """Pass the burst just ended on, with any held before it, once its class is known."""
+        b, self.burst = self.burst, array("h")
+        if b:
+            if self.ecg and len(b) in (EDF_ECG_COPY_FRAME, EDF_ECG_REAL_FRAME):
+                self.copies = len(b) == EDF_ECG_COPY_FRAME
+            self.pending.append(b)
+        if self.ecg and self.copies is None and not final and sum(map(len, self.pending)) < EDF_ECG_HOLD:
+            return
+        for p in self.pending:
+            keep = p
+            if self.ecg and self.copies:
+                keep = array("h")
+                for j in range(0, len(p), ECG_BLOCK_ROWS): keep.extend(p[j + ECG_COPY_ROWS:j + ECG_BLOCK_ROWS])
+                self.copy_rows += len(p) - len(keep)
+            self.kept.append(len(keep))
+            self.buf.extend(keep)
+        self.pending = []
+        if final or len(self.buf) >= 1 << 16:
+            self.f.write(self.buf.tobytes())
+            self.buf = array("h")
 
     def flush(self) -> None:
-        self.f.write(self.buf.tobytes())
-        self.buf = array("h")
+        """Close the last burst and write out everything held; call once all rows are in."""
+        self._close(final=True)
 
-    def frames(self) -> tuple[int, list[float | None], list[int]]:
-        """(rows per frame, stamp per frame, samples per frame). Rows per frame is
-        the commonest burst size (ties to the larger); a longer burst, two frames
-        that arrived less than EDF_BURST_GAP_S apart, is cut into frames of that
-        size, the later ones unstamped so they follow straight on."""
-        sizes = Counter(self.rows)
-        frame_rows = max(sizes, key=lambda n: (sizes[n], n))
+    def frames(self) -> tuple[int, int, list[float | None], list[int]]:
+        """(rows per frame, samples per frame, stamp per frame, samples in each
+        frame). Both sizes are the commonest burst size (ties to the larger), as
+        stored and as kept; a burst holding more samples, two frames that arrived
+        less than EDF_BURST_GAP_S apart, is cut into frames of that size, the
+        later ones unstamped so they follow straight on. A burst that kept
+        nothing still takes its record."""
+        rows, kept = Counter(self.rows), Counter(self.kept)
+        frame_rows = max(rows, key=lambda n: (rows[n], n))
+        spr = max(1, max(kept, key=lambda n: (kept[n], n)))
         stamps: list[float | None] = []
         counts: list[int] = []
-        for s, n in zip(self.starts, self.rows, strict=True):
-            for a in range(0, n, frame_rows):
-                b = min(n, a + frame_rows)
+        for s, k in zip(self.starts, self.kept, strict=True):
+            for a in range(0, max(k, 1), spr):
                 stamps.append(s if a == 0 else None)
-                counts.append(_edf_real_rows(b, self.ecg) - _edf_real_rows(a, self.ecg))
-        return frame_rows, stamps, counts
+                counts.append(min(spr, k - a))
+        return frame_rows, spr, stamps, counts
 
 def _edf_place(stamps: list[float | None], r0: int, period: float) -> list[int]:
     """Record index of each frame, the first at r0. Frames take one record each,
@@ -1370,10 +1412,10 @@ def _edf_write(o: BinaryIO, chans: list[_EdfChannel], patient: str, recording: s
     """Lay the channels' frames onto records and write the EDF to o. Every channel
     must be flushed. Returns the export stats."""
     layouts = [c.frames() for c in chans]
-    t0, period, recs = _edf_layout([st for _, st, _ in layouts])
+    t0, period, recs = _edf_layout([st for _, _, st, _ in layouts])
     dur_s = _edf_duration(period)
     dur = float(dur_s)
-    sprs = [max(1, _edf_real_rows(fr, c.ecg)) for c, (fr, _, _) in zip(chans, layouts, strict=True)]
+    sprs = [spr for _, spr, _, _ in layouts]
     n_records = max(rc[-1] for rc in recs) + 1
     start = datetime.fromtimestamp(t0, UTC)
     ns = len(chans)
@@ -1406,7 +1448,7 @@ def _edf_write(o: BinaryIO, chans: list[_EdfChannel], patient: str, recording: s
         for i, c in enumerate(chans):
             k, spr = nxt[i], sprs[i]
             if k < len(recs[i]) and recs[i][k] == rec:
-                n = layouts[i][2][k]
+                n = layouts[i][3][k]
                 o.write(c.f.read(2 * n))
                 o.write(bytes(2 * (spr - n)))
                 nxt[i] = k + 1
@@ -1414,7 +1456,7 @@ def _edf_write(o: BinaryIO, chans: list[_EdfChannel], patient: str, recording: s
                 o.write(bytes(2 * spr))
 
     stats = []
-    for c, (frame_rows, _, counts), rc, spr in zip(chans, layouts, recs, sprs, strict=True):
+    for c, (frame_rows, spr, _, counts), rc in zip(chans, layouts, recs, strict=True):
         samples, frames = sum(counts), len(counts)
         stats.append({
             "physio_id": c.physio_id,

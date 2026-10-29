@@ -11,6 +11,10 @@ observable effect, then cancels. Tests are plain `async def` run by pytest-async
 import asyncio
 import json
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
 
 import vscc_mqtt_timescale_worker as w
 
@@ -120,6 +124,44 @@ async def test_tail_file_csv_publishes_waveform(tmp_path):
     assert payload["physio_id"] == "NOM_PLETH"
     assert payload["value"] == 1.23
     assert any(row[1] == "NOM_PLETH" and row[2] == 1.23 for row in w.waveforms_buffer)
+
+
+@pytest.mark.parametrize(("physio_id", "block", "ecg"), [
+    ("NOM_ECG_ELEC_POTL_II", 192, True),
+    ("NOM_ECG_ELEC_POTL_I", 192, True),
+    ("NOM_PLETH", 32, False),
+])
+async def test_tail_file_csv_drops_ecg_copy_rows(tmp_path: Path, physio_id: str, block: int, ecg: bool) -> None:
+    # WOR-976: CSV column 1 counts blocks (+2048 each). An ECG block's first 64
+    # rows are a copy, so the tailer keeps rows 65..192, and drops the block it
+    # joins mid-way (the lead-in) whole. Other waves pass every row.
+    w.waveforms_buffer.clear()
+    stamp = "14-03-2026 04:39:00.500"
+    lead_in = [f"0,1000,{stamp},{9000 + i}" for i in range(block // 4)]
+    blocks = [f"{b},{3048 + 2048 * b},{stamp},{1000 * b + i}" for b in range(3) for i in range(block)]
+    want = [1000 * b + i for b in range(3) for i in range(64, block)] if ecg else \
+        [9000 + i for i in range(len(lead_in))] + [1000 * b + i for b in range(3) for i in range(block)]
+
+    f = tmp_path / f"{physio_id}WaveExport.csv"
+    f.write_text("")
+    client = FakeMqttClient()
+    config = {"path": f, "type": "csv", "topic": "mp50/HF-X", "physio_id": physio_id}
+    task = asyncio.create_task(w.tail_file(config, cast(Any, client)))
+    try:
+        await asyncio.sleep(0.5)  # let tail_file open the file and seek to EOF
+        with open(f, "a") as fh:
+            fh.write("".join(line + "\n" for line in lead_in + blocks))
+        for _ in range(int(TIMEOUT / 0.05)):
+            if len(client.published) >= len(want):
+                break
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.2)  # rows past `want` would land here
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert [p["value"] for _, p in client.published] == want
+    assert [row[2] for row in w.waveforms_buffer if row[1] == physio_id] == want
 
 
 async def test_batch_inserter_flushes_numerics():
