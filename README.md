@@ -202,10 +202,14 @@ browser; the same API is available to scripts:
 
 An export package contains `session.json` (metadata + the same quality/loss
 statistics), `numerics.csv|.parquet` and `waveforms.csv|.parquet`, all times ISO 8601
-UTC. EDF files are generated on demand and place samples on a per-second grid at
-each signal's measured nominal rate, so gaps stay aligned (zero-filled) and channel
-timing never drifts; values are 16-bit quantized over a symmetric range (digital
-0 = physical 0).
+UTC. EDF files are generated on demand with one record per monitor frame: the record
+duration is the session's measured frame period (about 1.0244 s), so the header rates
+are the true sample rates (ECG about 499.8 Hz, pleth 124.9, resp 62.5). The ECG keeps
+real samples only: the 250 Hz copy that leads each 192-row block in the capture is
+dropped. A missing frame becomes an all-zero record and a short frame is zero-padded,
+so channel timing never drifts; values are 16-bit quantized over a symmetric range
+(digital 0 = physical 0). Next to the EDF, `waveforms.edf.json` holds the period,
+rates and the counts of dropped copy rows, padded samples and all-zero records.
 
 ### Configuring the capture service from the dashboard
 
