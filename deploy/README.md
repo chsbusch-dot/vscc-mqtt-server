@@ -8,7 +8,7 @@ bucket A: containerized, GHCR images, LAN only, patient data stays local.
 |---|---|
 | URL | `https://vscc.lan.synviron.com`, via caddy-lan and **Authelia**: no login from the LAN since WOR-898, `one_factor` from every other source (see Access below). The app has no login of its own |
 | Host | `prd-ubu-apphost` `192.168.1.212`, compose project `vscc` |
-| Stack dir on the box | `/opt/apphost/vscc`, a git checkout of this repo, detached at the deployed commit (WOR-1034). It fetches over anonymous HTTPS, so the box holds no credential |
+| Stack dir on the box | `/opt/apphost/vscc`, a git checkout of this repo, detached at the deployed commit (WOR-1034). It fetches over anonymous HTTPS, so the box holds no credential. That works only while this repo is public: if it ever goes private, the box needs a read-only deploy key before the next deploy, or the fetch fails and `vscc-deploy.sh` exits 3 before compose runs |
 | Compose | `docker-compose.yml` (base, the public install) + `compose.production.yml` (overlay) |
 | Host ports | **none**. Only `vscc-dashboard` joins the external `edge` network |
 | Database | TimescaleDB 2.19.3-pg14, data dir bind-mounted from `/srv/vscc-data/timescaledb` (its own thin VMDK, homelab-owned, fstab by UUID, `nofail`) |
