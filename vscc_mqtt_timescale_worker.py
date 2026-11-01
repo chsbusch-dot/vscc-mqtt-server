@@ -348,6 +348,10 @@ SCHEMA_STATEMENTS = [
     )""",
     "SELECT create_hypertable('patient_numerics', 'time', if_not_exists => TRUE)",
     "SELECT create_hypertable('patient_waveforms', 'time', if_not_exists => TRUE)",
+    # 1-day chunks (new chunks only): a kept session pins about a day of chunk
+    # instead of a week, since retention drops and keeps whole chunks.
+    "SELECT set_chunk_time_interval('patient_numerics', INTERVAL '1 day')",
+    "SELECT set_chunk_time_interval('patient_waveforms', INTERVAL '1 day')",
     """CREATE MATERIALIZED VIEW IF NOT EXISTS patient_waveforms_1min
        WITH (timescaledb.continuous) AS
        SELECT physio_id,
@@ -362,8 +366,8 @@ SCHEMA_STATEMENTS = [
         end_offset   => INTERVAL '1 minute',
         schedule_interval => INTERVAL '5 minutes',
         if_not_exists => TRUE)""",
-    "SELECT add_retention_policy('patient_numerics', INTERVAL '12 hours', if_not_exists => TRUE)",
-    "SELECT add_retention_policy('patient_waveforms', INTERVAL '12 hours', if_not_exists => TRUE)",
+    # No stock retention policy here: apply_retention() installs the keep-aware
+    # retention job once the sessions table below exists.
     # Sessions: time-range metadata over the data axis (no per-row tagging).
     """CREATE TABLE IF NOT EXISTS sessions (
         id SERIAL PRIMARY KEY,
@@ -373,6 +377,8 @@ SCHEMA_STATEMENTS = [
         started_at TIMESTAMPTZ NOT NULL,
         ended_at TIMESTAMPTZ
     )""",
+    # keep = true exempts the chunks under a session from retention.
+    "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS keep BOOLEAN NOT NULL DEFAULT FALSE",
     """CREATE TABLE IF NOT EXISTS vscc_settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -504,12 +510,87 @@ async def get_settings() -> dict[str, str]:
     settings.update({r["key"]: r["value"] for r in rows})
     return settings
 
+# Keep-aware retention. Timescale's stock retention policy drops every chunk past
+# the window, kept recordings included, so it is replaced by one daily job that
+# drops whole chunks past the window unless a kept session overlaps them.
+# vscc_retention_plan() is the decision rule: the job executes its 'drop' rows,
+# and calling it by hand is the dry run, e.g.
+#   SELECT * FROM vscc_retention_plan('72 hours', now() + interval '1 day');
+# Whole chunks only, never row deletes (row order inside a chunk is preserved).
+RETENTION_TABLES = ("patient_numerics", "patient_waveforms")
+RETENTION_PROC = "vscc_retention_job"
+
+RETENTION_PLAN_SQL = """
+CREATE OR REPLACE FUNCTION vscc_retention_plan(drop_after interval, as_of timestamptz DEFAULT now())
+RETURNS TABLE (hypertable text, chunk text, range_start timestamptz, range_end timestamptz,
+               action text, reason text)
+LANGUAGE sql STABLE AS $$
+    SELECT c.hypertable_name::text,
+           format('%I.%I', c.chunk_schema, c.chunk_name),
+           c.range_start, c.range_end,
+           CASE WHEN c.range_end <= as_of - drop_after
+                THEN CASE WHEN k.ids IS NULL THEN 'drop' ELSE 'keep' END
+                ELSE 'in-window' END,
+           CASE WHEN c.range_end <= as_of - drop_after
+                THEN CASE WHEN k.ids IS NULL THEN 'older than the retention window, no kept session'
+                          ELSE 'overlaps kept session ' || k.ids END
+                ELSE 'ends inside the retention window' END
+    FROM timescaledb_information.chunks c
+    -- Kept sessions overlapping [range_start, range_end). ended_at is inclusive
+    -- (the last row sits at ended_at). A session still recording (ended_at null)
+    -- runs on, which for any droppable chunk is the same as running to now().
+    LEFT JOIN LATERAL (
+        SELECT string_agg(s.id::text, ',' ORDER BY s.id) AS ids
+        FROM sessions s
+        WHERE s.keep
+          AND s.started_at < c.range_end
+          AND COALESCE(s.ended_at, 'infinity') >= c.range_start
+    ) k ON TRUE
+    WHERE c.hypertable_schema = 'public'
+      AND c.hypertable_name IN ('patient_numerics', 'patient_waveforms')
+    ORDER BY c.hypertable_name, c.range_start
+$$
+"""
+
+RETENTION_JOB_SQL = """
+CREATE OR REPLACE PROCEDURE vscc_retention_job(job_id int, config jsonb)
+LANGUAGE plpgsql AS $$
+DECLARE
+    drop_after interval := (config->>'drop_after')::interval;
+    p record;
+BEGIN
+    IF drop_after IS NULL OR drop_after <= interval '0' THEN
+        RAISE EXCEPTION 'vscc_retention_job: config drop_after must be a positive interval, got %', config;
+    END IF;
+    FOR p IN SELECT * FROM vscc_retention_plan(drop_after) WHERE action = 'drop' LOOP
+        -- Exactly this chunk: drop_chunks takes chunks lying wholly inside the bounds.
+        PERFORM drop_chunks(format('public.%I', p.hypertable)::regclass, older_than => p.range_end, newer_than => p.range_start);
+        RAISE LOG 'vscc_retention_job: dropped % [%, %)', p.chunk, p.range_start, p.range_end;
+    END LOOP;
+END
+$$
+"""
+
 async def apply_retention(hours: int):
-    """Live-update the retention policies (whole-chunk drops, applied by Timescale's scheduler)."""
+    """Install keep-aware retention for `hours`: the plan function, the job
+    procedure and exactly one daily job, with the stock retention policies
+    removed. Idempotent and all-or-nothing, so on any error the previous setup
+    stays in place. The job is replaced on every call, which runs it once now."""
+    hours = int(hours)
+    if hours <= 0:
+        raise ValueError("retention hours must be positive")
+    config = json.dumps({"drop_after": f"{hours} hours"})
     async with db_pool.acquire() as conn:
-        for table in ("patient_numerics", "patient_waveforms"):
-            await conn.execute(f"SELECT remove_retention_policy('{table}', if_exists => TRUE)")
-            await conn.execute(f"SELECT add_retention_policy('{table}', INTERVAL '{int(hours)} hours', if_not_exists => TRUE)")
+        async with conn.transaction():
+            await conn.execute(RETENTION_PLAN_SQL)
+            await conn.execute(RETENTION_JOB_SQL)
+            for table in RETENTION_TABLES:
+                await conn.execute(f"SELECT remove_retention_policy('{table}', if_exists => TRUE)")
+            await conn.execute(
+                "SELECT delete_job(job_id) FROM timescaledb_information.jobs "
+                "WHERE proc_schema = 'public' AND proc_name = $1", RETENTION_PROC)
+            await conn.execute(
+                f"SELECT add_job('{RETENTION_PROC}', INTERVAL '1 day', config => $1::jsonb)", config)
 
 @app.get("/api/settings")
 async def read_settings():
@@ -770,7 +851,7 @@ def _session_dict(r) -> dict[str, Any]:
     return {"id": r["id"], "label": r["label"], "subject_code": r["subject_code"],
             "notes": r["notes"], "started_at": r["started_at"].timestamp(),
             "ended_at": r["ended_at"].timestamp() if r["ended_at"] else None,
-            "recording": r["ended_at"] is None}
+            "recording": r["ended_at"] is None, "keep": bool(r.get("keep", False))}
 
 @app.get("/api/sessions")
 async def list_sessions():
@@ -780,7 +861,12 @@ async def list_sessions():
 
 @app.patch("/api/sessions/{session_id}")
 async def update_session(session_id: int, payload: dict[str, Any]):
-    fields = {k: str(payload[k]) for k in ("label", "subject_code", "notes") if k in payload}
+    fields: dict[str, Any] = {k: str(payload[k]) for k in ("label", "subject_code", "notes") if k in payload}
+    # keep = true exempts the session's chunks from retention; false hands them back.
+    if "keep" in payload:
+        if not isinstance(payload["keep"], bool):
+            return {"ok": False, "error": "keep must be true or false"}
+        fields["keep"] = payload["keep"]
     if not fields:
         return {"ok": False, "error": "nothing to update"}
     sets = ", ".join(f"{k} = ${i+2}" for i, k in enumerate(fields))
@@ -797,6 +883,8 @@ async def delete_session(session_id: int, purge_data: bool = True):
             return {"ok": False, "error": "not found"}
         if r["ended_at"] is None:
             return {"ok": False, "error": "session is recording — cannot delete a live session"}
+        if r.get("keep"):
+            return {"ok": False, "error": "session is kept — clear keep before deleting it"}
         deleted_rows = 0
         if purge_data:
             for table in ("patient_numerics", "patient_waveforms"):

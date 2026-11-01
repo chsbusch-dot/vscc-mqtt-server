@@ -16,6 +16,9 @@ CREATE TABLE IF NOT EXISTS patient_waveforms (
 -- 3. Convert both tables into TimescaleDB hypertables for time-series efficiency
 SELECT create_hypertable('patient_numerics', 'time', if_not_exists => TRUE);
 SELECT create_hypertable('patient_waveforms', 'time', if_not_exists => TRUE);
+-- 1-day chunks: retention drops and keeps whole chunks, so a kept session pins about a day
+SELECT set_chunk_time_interval('patient_numerics', INTERVAL '1 day');
+SELECT set_chunk_time_interval('patient_waveforms', INTERVAL '1 day');
 
 -- 4. Create a continuous aggregate for 1-minute downsampled waveform data
 CREATE MATERIALIZED VIEW patient_waveforms_1min
@@ -37,6 +40,17 @@ SELECT add_continuous_aggregate_policy('patient_waveforms_1min',
     end_offset   => INTERVAL '1 minute',
     schedule_interval => INTERVAL '5 minutes');
 
--- 6. Add data retention policies for automatic cleanup (replaces cleanup.py)
-SELECT add_retention_policy('patient_numerics', INTERVAL '12 hours', if_not_exists => TRUE);
-SELECT add_retention_policy('patient_waveforms', INTERVAL '12 hours', if_not_exists => TRUE);
+-- 6. Sessions, with the keep flag that exempts a session's chunks from retention
+CREATE TABLE IF NOT EXISTS sessions (
+    id SERIAL PRIMARY KEY,
+    label TEXT NOT NULL DEFAULT '',
+    subject_code TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    started_at TIMESTAMPTZ NOT NULL,
+    ended_at TIMESTAMPTZ
+);
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS keep BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- 7. Retention: no stock retention policy. The worker installs the keep-aware
+-- retention job (vscc_retention_plan / vscc_retention_job) on start, using
+-- vscc_settings.retention_hours.

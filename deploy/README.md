@@ -83,9 +83,20 @@ then run `deploy/vscc-up.sh` there with the password piped as in `vscc-deploy.sh
 
 ## Retention and disk
 
-The worker re-applies `vscc_settings.retention_hours` as TimescaleDB retention
-policies on every start. The dashboard's Settings panel changes it. A
-retention job drops whole chunks older than the window. The data disk was sized
+The worker installs keep-aware retention on every start and whenever
+`vscc_settings.retention_hours` changes (the dashboard's Settings panel). It is one
+daily TimescaleDB job, `vscc_retention_job`, in place of the stock retention
+policies: it drops whole chunks that ended more than `retention_hours` ago, except
+a chunk that overlaps a session with `keep = true` (`PATCH /api/sessions/{id}`).
+Chunks are 1 day, so a kept session pins about a day of chunk. Dry run, read only:
+
+```sql
+SELECT * FROM vscc_retention_plan('72 hours');                       -- as of now
+SELECT * FROM vscc_retention_plan('72 hours', now() + interval '1 day'); -- tomorrow's run
+```
+
+Lowering `retention_hours` never drops a kept chunk. Kept chunks grow the disk
+until the session is un-kept. The data disk was sized
 at about 2x the restored history, so watch it:
 `ssh chris@192.168.1.212 df -h /srv/vscc-data`. If it fills, only vscc stops.
 

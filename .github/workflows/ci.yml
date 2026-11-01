@@ -14,6 +14,24 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
 
+    # Real TimescaleDB for the keep-aware retention tests (tests/test_retention.py),
+    # the same image and digest production runs.
+    services:
+      timescaledb:
+        image: timescale/timescaledb:2.19.3-pg14@sha256:0f5553d37abbe0f20bfe0a04dab5d1238955b5cda2711aba403090f95b6e51ff
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      VSCC_TEST_TSDB_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+
     steps:
       - uses: actions/checkout@v4
 

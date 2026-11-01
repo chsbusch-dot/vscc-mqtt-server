@@ -158,7 +158,7 @@ Philips MP50 ──UDP──► VSCaptureCLI ──► export files (JSON numeri
 1.  **VSCapture CLI (`systemd` service `vscc-capture-cli`):** A .NET application that connects to the patient monitor and writes raw telemetry to export files in `VSCapture/`. It runs under a keep-alive wrapper (repo file `vscc-capture-loop.sh`, installed by `install.sh` as `VSCapture/vscc-loop.sh`) that pings the monitor before launching and restarts the capture automatically when the monitor goes offline or the UDP connection times out — the service never enters a failed state while waiting for the monitor. The wrapper also handles the MP50's single-association limit: a silent-hang watchdog recycles a capture that runs without producing data (stale association), and abrupt stops are time-stamped so the next start waits out the monitor's ~90 s association timeout. Net effect: `systemctl restart vscc-capture-cli` is always safe; expect up to ~90 s before data resumes.
 2.  **Python Worker (`docker` container):** Tails the vitals JSON plus every waveform CSV it discovers (`NOM_*WaveExport.csv` — a newly connected monitor module streams automatically, no code change), publishes each sample to a per-signal MQTT topic, batch-inserts everything into TimescaleDB, and serves historic data over FastAPI on port **8001**.
 3.  **EMQX (`docker` container):** The MQTT broker. Raw TCP on **1883**, MQTT-over-WebSocket on **8083** (path `/mqtt`) for browser clients, admin dashboard on **18083** (default login `admin` / `public` — EMQX forces a password change on first login; do it).
-4.  **TimescaleDB (`docker` container):** PostgreSQL + TimescaleDB on **5432** (db `telemetry`, hypertables `patient_numerics` / `patient_waveforms`, 12 h retention).
+4.  **TimescaleDB (`docker` container):** PostgreSQL + TimescaleDB on **5432** (db `telemetry`, hypertables `patient_numerics` / `patient_waveforms` in 1-day chunks, 72 h keep-aware retention: chunks under a kept session stay).
 5.  **WebSocket Streamer (`systemd` service `vscc-websocket-streamer`):** Serves the raw numerics JSON over HTTP and a normalized live stream over WebSocket, both on port **8000**.
 
 ### MQTT topics and payload
@@ -187,8 +187,8 @@ browser; the same API is available to scripts:
 | `GET /api/sessions` | List sessions (newest first) |
 | `POST /api/sessions` | Start a fresh named session (`label`, `subject_code`, `notes`) at the current boundary |
 | `POST /api/sessions/{id}/stop` | Explicitly stop recording an open session |
-| `PATCH /api/sessions/{id}` | Rename / set subject code / notes |
-| `DELETE /api/sessions/{id}` | Delete a closed session (+ its data rows) |
+| `PATCH /api/sessions/{id}` | Rename / set subject code / notes; `keep: true` makes the session permanent (retention skips its chunks), `keep: false` hands it back |
+| `DELETE /api/sessions/{id}` | Delete a closed, unkept session (+ its data rows) |
 | `GET /api/sessions/{id}/data` | Replay payload for the dashboard charts |
 | `GET /api/sessions/{id}/signals` | Distinct numeric/waveform signals in range |
 | `POST` / `GET` / `DELETE /api/annotations` | Timestamped event markers (e.g. "intubation"), optionally tied to a session |
@@ -271,7 +271,7 @@ vscc-mqtt-server/
 ├── vscc-websocket-streamer.py    # Streamer: raw JSON over HTTP + normalized WS stream (:8000)
 ├── vscc-install-capture-cli.sh   # Installs the VSCaptureCLI systemd service
 ├── vscc-install-websocket-streamer.sh # Installs the streamer systemd service
-├── vscc-init-timescaledb.sql     # Creates hypertables + retention policies on first DB start
+├── vscc-init-timescaledb.sql     # Creates hypertables + sessions on first DB start (the worker installs retention)
 ├── vscc-file-cleanup.py    # Hourly cron: truncates oversized export files
 ├── vscc-rawdata-spotcheck.py # Diagnostic: detect real vitals vs flatline/noise in exports
 ├── vscc-rawdata-format-probe.py # Diagnostic: identify the format of JSON / raw export files
