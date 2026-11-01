@@ -28,6 +28,9 @@ htmlcov/
 sessions/
 .env
 
+# Written by deploy/vscc-deploy.sh in the .212 checkout
+/.deployed-commit
+
 # BI camera .reg exports contain API tokens/keys — never commit
 cam settings/
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Start or update the vscc stack on the .212 app host. Runs ON the box, from the
-# deployed tree /opt/apphost/vscc. deploy/vscc-deploy.sh (on the Mac) ships the
-# tree and calls this with POSTGRES_PASSWORD piped from BWS over ssh stdin, so
-# the secret is never written to disk.
+# git checkout /opt/apphost/vscc. deploy/vscc-deploy.sh (on the Mac) checks out
+# the commit there and calls this with POSTGRES_PASSWORD piped from BWS over ssh
+# stdin, so the secret is never written to disk.
 #
 # Exit codes: 3 = pre-flight refused (data disk / data dir / edge network),
 #             4 = started but not healthy within ~3 min.
@@ -49,4 +49,4 @@ if [ "$db" != healthy ] || [ "$wk" != healthy ]; then
     echo "NOT HEALTHY: timescaledb=$db worker=$wk"
     exit 4
 fi
-echo "vscc up at $(cat .deployed-commit 2>/dev/null || echo '?'): timescaledb and worker healthy"
+echo "vscc up at $(git rev-parse HEAD 2>/dev/null || cat .deployed-commit 2>/dev/null || echo '?'): timescaledb and worker healthy"
