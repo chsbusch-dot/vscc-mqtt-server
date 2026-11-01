@@ -21,8 +21,8 @@
 #  - POSTGRES_PASSWORD is required, piped from BWS at deploy (never on disk).
 #
 # The database was restored from VM 242 (see deploy/migrate-212/README.md). Its
-# retention policy is whatever vscc_settings.retention_hours says; the worker
-# re-applies it on every start.
+# retention window is whatever vscc_settings.retention_hours says; the worker
+# re-installs its keep-aware retention job on every start (deploy/README.md).
 
 x-logging: &logging
   driver: json-file
