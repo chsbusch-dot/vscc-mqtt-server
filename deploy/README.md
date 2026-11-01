@@ -8,7 +8,7 @@ bucket A: containerized, GHCR images, LAN only, patient data stays local.
 |---|---|
 | URL | `https://vscc.lan.synviron.com`, via caddy-lan and **Authelia**: no login from the LAN since WOR-898, `one_factor` from every other source (see Access below). The app has no login of its own |
 | Host | `prd-ubu-apphost` `192.168.1.212`, compose project `vscc` |
-| Stack dir on the box | `/opt/apphost/vscc` (a `git archive` of this repo, `.deployed-commit`) |
+| Stack dir on the box | `/opt/apphost/vscc`, a git checkout of this repo, detached at the deployed commit (WOR-1034). It fetches over anonymous HTTPS, so the box holds no credential |
 | Compose | `docker-compose.yml` (base, the public install) + `compose.production.yml` (overlay) |
 | Host ports | **none**. Only `vscc-dashboard` joins the external `edge` network |
 | Database | TimescaleDB 2.19.3-pg14, data dir bind-mounted from `/srv/vscc-data/timescaledb` (its own thin VMDK, homelab-owned, fstab by UUID, `nofail`) |
@@ -66,20 +66,42 @@ authentication and register it in homelab-infra `network/ports.md`.
 
 ```bash
 ~/VSCode/vscc-mqtt-server/deploy/vscc-deploy.sh            # origin/main
+~/VSCode/vscc-mqtt-server/deploy/vscc-deploy.sh <sha>      # any pushed commit
 ```
 
-It ships the tree, then `deploy/vscc-up.sh` runs on the box. The pre-flight
-refuses (exit 3) when `/srv/vscc-data` is not mounted, a data dir is missing, or
-no database exists yet. Then it runs `pull` and `up -d`, and waits until
-TimescaleDB and the worker report healthy (exit 4 otherwise).
+The box updates its own checkout: `vscc-deploy.sh` resolves the ref on the Mac,
+then over ssh has `/opt/apphost/vscc` run `git fetch origin` and
+`git checkout --detach <sha>`. It refuses (exit 5) when a tracked file on the box
+is modified, and it stops (exit 3, 5 or 6) unless box HEAD equals the requested
+commit afterwards. Nothing restarts on a non-zero exit. The ref must be pushed,
+since the box fetches from GitHub and never from the Mac. The commit is also
+written to `.deployed-commit` (gitignored), so `git status` on the box stays clean.
+
+Then `deploy/vscc-up.sh` runs on the box. The pre-flight refuses (exit 3) when
+`/srv/vscc-data` is not mounted, a data dir is missing, or no database exists yet.
+Then it runs `pull` and `up -d`, restarts the dashboard (so it re-reads the
+bind-mounted `dashboard-nginx.conf`), and waits until TimescaleDB and the worker
+report healthy (exit 4 otherwise).
+
+Check what the box runs:
+
+```bash
+ssh chris@192.168.1.212 'git -C /opt/apphost/vscc rev-parse HEAD; git -C /opt/apphost/vscc status --porcelain'
+```
 
 **Images** are pinned by digest in `compose.production.yml`. To roll one
 forward, replace the digest (the CI `Publish images` workflow pushes `latest`;
 read the new digest from GHCR), open a PR, merge, redeploy.
 
-**Rollback:** `/opt/apphost/vscc.prev` holds the previous tree:
-`ssh chris@192.168.1.212 'cd /opt/apphost && mv vscc vscc.bad && mv vscc.prev vscc'`,
-then run `deploy/vscc-up.sh` there with the password piped as in `vscc-deploy.sh`.
+**Rollback:** deploy the previous commit. Each run prints it as `box before:`
+and as a ready `rollback:` line:
+`~/VSCode/vscc-mqtt-server/deploy/vscc-deploy.sh <previous-sha>`.
+
+**A new box** needs the clone once, before the first deploy:
+`git clone https://github.com/chsbusch-dot/vscc-mqtt-server.git /opt/apphost/vscc`
+(as `chris`). Until 2026-11-01 the box held a `git archive` copy instead. The
+last archive tree is kept as `/opt/apphost/vscc.archive-2026-11-01`, and the one
+before it as `/opt/apphost/vscc.prev`. Neither is used any more.
 
 ## Retention and disk
 
