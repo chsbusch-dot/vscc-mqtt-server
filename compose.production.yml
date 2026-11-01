@@ -81,7 +81,7 @@ services:
     logging: *logging
 
   worker:
-    image: ghcr.io/chsbusch-dot/vscc-worker:latest@sha256:817f911d8172ae6ed3bf83ecbaed58994ea05f88b4932fd4c2a53c6fe449c01a
+    image: ghcr.io/chsbusch-dot/vscc-worker:latest@sha256:f694db207cd60aa5491b24bd98d08dfd445bf419346241433e5116cd9e93d064
     container_name: vscc-worker
     ports: !reset []
     environment:
