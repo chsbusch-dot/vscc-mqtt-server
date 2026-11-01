@@ -100,8 +100,9 @@ and as a ready `rollback:` line:
 **A new box** needs the clone once, before the first deploy:
 `git clone https://github.com/chsbusch-dot/vscc-mqtt-server.git /opt/apphost/vscc`
 (as `chris`). Until 2026-11-01 the box held a `git archive` copy instead. The
-last archive tree is kept as `/opt/apphost/vscc.archive-2026-11-01`, and the one
-before it as `/opt/apphost/vscc.prev`. Neither is used any more.
+last archive tree is kept as `/opt/apphost/vscc.archive-2026-11-01` and is not
+used. The copy before it, `/opt/apphost/vscc.prev` (84dfcfa), was deleted on
+2026-11-01 on Chris's word.
 
 ## Retention and disk
 
