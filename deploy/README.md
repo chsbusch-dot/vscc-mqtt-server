@@ -62,6 +62,14 @@ signs to every host that can reach `.212`, with no Authelia policy in front and
 past ufw (Docker-published ports bypass it). If a LAN consumer ever needs it, publish it deliberately with
 authentication and register it in homelab-infra `network/ports.md`.
 
+**Only the worker may publish (WOR-1092).** `deploy/emqx-acl.conf`, mounted over
+EMQX's `acl.conf`, keys on the listener, since a username proves nothing on an
+anonymous broker. The stack-internal `tcp:default` listener (1883) may publish
+and subscribe. Every other listener, including the websocket behind `/mqtt`,
+may only subscribe, and the last rule denies the rest. A browser that publishes
+is ignored (MQTT 5 QoS 1 gets PUBACK `0x87` Not authorized). Publishing `1883`
+on the host would hand that right to the LAN, which is one more reason not to.
+
 ## Deploy / update (from the Mac)
 
 ```bash
@@ -81,7 +89,11 @@ Then `deploy/vscc-up.sh` runs on the box. The pre-flight refuses (exit 3) when
 `/srv/vscc-data` is not mounted, a data dir is missing, or no database exists yet.
 Then it runs `pull` and `up -d`, restarts the dashboard (so it re-reads the
 bind-mounted `dashboard-nginx.conf`), and waits until TimescaleDB and the worker
-report healthy (exit 4 otherwise).
+report healthy (exit 4 otherwise). EMQX never restarts alone, because the worker
+does not reconnect to a restarted broker (WOR-840): when the running ACL differs
+from `deploy/emqx-acl.conf` the script restarts EMQX and the worker together, and
+when `up` recreated EMQX it restarts the worker. It exits 4 unless the worker
+then holds an EMQX connection.
 
 Check what the box runs:
 

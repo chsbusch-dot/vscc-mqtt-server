@@ -13,6 +13,8 @@
 #    the stack network: /api -> worker, /mqtt -> EMQX websocket,
 #    /DataExportVSC.json + /ws/stream -> streamer. MQTT 1883, the EMQX admin UI
 #    18083 and Postgres 5432 stay stack-internal;
+#  - EMQX gets an ACL (deploy/emqx-acl.conf, WOR-1092): only the stack-internal
+#    1883 listener may publish, the websocket behind /mqtt may only subscribe;
 #  - TimescaleDB lives on its OWN disk, bind-mounted from /srv/vscc-data (homelab
 #    mounts it by UUID, nofail). create_host_path: false makes a missing mount
 #    fail closed instead of silently filling the root disk. Session exports
@@ -37,6 +39,8 @@ services:
     ports: !reset []
     volumes:
       - vscc-emqx-data:/opt/emqx/data
+      # read at boot only; vscc-up.sh restarts EMQX with the worker when it changes
+      - ./deploy/emqx-acl.conf:/opt/emqx/etc/acl.conf:ro
     mem_limit: 768m
     cpus: 1.0
     logging: *logging
