@@ -70,6 +70,23 @@ ECG_PREFIX = "NOM_ECG_ELEC_POTL"
 ECG_BLOCK_ROWS = 192
 ECG_COPY_ROWS = 64
 
+# EEG (WOR-1008): the MP50 exports its two EEG channels as one wave and one
+# numerics set. Each 64-row col1 block of NOM_EEG_ELEC_POTL_CRTX is 32 rows of
+# channel 1, then 32 of channel 2 (~125 Hz each), and every EEG numerics poll is
+# two DataExportVSC.json lines with the same Relativetimestamp, channel 1 first.
+# The tailer keeps the combined series as they were and adds per-channel ones
+# alongside, named <PhysioID>_EEG1 / <PhysioID>_EEG2 (wave topics
+# mp50/HF-EEG_ELEC_POTL_CRTX_EEG1 / _EEG2, numerics on mp50/VitalSigns).
+EEG_PREFIX = "NOM_EEG"
+EEG_WAVE_ID = "NOM_EEG_ELEC_POTL_CRTX"
+EEG_CHANNELS = 2
+EEG_CHANNEL_ROWS = 32
+
+
+def eeg_channel_id(physio_id: str, channel: int) -> str:
+    """NOM_EEG_PWR_SPEC_TOT, 2 -> NOM_EEG_PWR_SPEC_TOT_EEG2"""
+    return f"{physio_id}_EEG{channel}"
+
 
 def physio_id_from_wave_file(path: Path) -> str:
     """NOM_PLETHWaveExport.csv -> NOM_PLETH"""
@@ -208,6 +225,9 @@ async def batch_inserter():
 async def tail_file(config: dict[str, Any], client: aiomqtt.Client):
     file_path, file_type, topic = config["path"], config["type"], config["topic"]
     ecg = file_type == "csv" and (config["physio_id"] or "").startswith(ECG_PREFIX)
+    eeg = file_type == "csv" and config["physio_id"] == EEG_WAVE_ID
+    eeg_topics = {ch: (eeg_channel_id(EEG_WAVE_ID, ch), wave_topic(eeg_channel_id(EEG_WAVE_ID, ch)))
+                  for ch in range(1, EEG_CHANNELS + 1)}
     print(f"Waiting for file: {file_path}...")
     while not file_path.exists() or not file_path.is_file(): await asyncio.sleep(1)
     print(f"File found: {file_path}. Tailing live data for topic {topic}...")
@@ -232,6 +252,9 @@ async def tail_file(config: dict[str, Any], client: aiomqtt.Client):
                 # ECG block state, fresh on every (re)open: the block this open
                 # joins mid-way is dropped whole, its copy rows can't be told apart.
                 blk_id, blk_ok, blk_i = None, False, 0
+                # EEG numerics poll state, same rule: the poll this open joins
+                # mid-way gets no per-channel rows (its first line may be channel 2).
+                eeg_rel, eeg_ok, eeg_n = None, False, 0
 
                 while True:
                     line = await f.readline()
@@ -246,6 +269,8 @@ async def tail_file(config: dict[str, Any], client: aiomqtt.Client):
                                 print(f"Timeout on {file_path.name}. Sending disconnect signal to {topic}.")
                                 null_payload = json.dumps({"value": None, "physio_id": config["physio_id"], "time": datetime.now(UTC).timestamp()})
                                 await client.publish(topic, payload=null_payload, qos=0)
+                                for ch_id, ch_topic in eeg_topics.values() if eeg else ():
+                                    await client.publish(ch_topic, payload=json.dumps({"value": None, "physio_id": ch_id, "time": datetime.now(UTC).timestamp()}), qos=0)
                                 disconnected_sent = True
                         
                         # 2. Check for File Rotation (vscc-file-cleanup.py)
@@ -274,6 +299,13 @@ async def tail_file(config: dict[str, Any], client: aiomqtt.Client):
                         try:
                             data_array = json.loads(line)
                             if isinstance(data_array, dict): data_array = [data_array]
+                            ch = None
+                            if data_array and all(str(r.get("PhysioID", "")).startswith(EEG_PREFIX) for r in data_array):
+                                rel = data_array[0].get("Relativetimestamp")
+                                if rel is not None:
+                                    if rel != eeg_rel: eeg_ok, eeg_rel, eeg_n = eeg_rel is not None, rel, 0
+                                    eeg_n += 1
+                                    if eeg_ok and eeg_n <= EEG_CHANNELS: ch = eeg_n
                             for record in data_array:
                                 _track_source_integrity(record)
                                 val_str = record.get("Value", "-")
@@ -286,16 +318,21 @@ async def tail_file(config: dict[str, Any], client: aiomqtt.Client):
                                 numerics_buffer.append((parsed_time, physio_id, value_float))
                                 payload = json.dumps({"time": parsed_time.timestamp(), "physio_id": physio_id, "value": value_float})
                                 await client.publish(topic, payload=payload, qos=0)
+                                if ch is not None:
+                                    ch_id = eeg_channel_id(physio_id, ch)
+                                    numerics_buffer.append((parsed_time, ch_id, value_float))
+                                    payload = json.dumps({"time": parsed_time.timestamp(), "physio_id": ch_id, "value": value_float})
+                                    await client.publish(topic, payload=payload, qos=0)
                         except Exception as e:
                             print(f"Skipped bad JSON line on {topic}: {e} | {line[:120]!r}")
                     elif file_type == "csv":
                         try:
                             parts = line.split(',')
                             if len(parts) < 4: continue
-                            if ecg:  # keep rows 65..192 of each col1 block, from the first full block on
+                            if ecg or eeg:  # rows counted per col1 block, from the first full block on
                                 if parts[1] != blk_id: blk_ok, blk_id, blk_i = blk_id is not None, parts[1], 0
                                 blk_i += 1
-                                if not blk_ok or blk_i <= ECG_COPY_ROWS: continue
+                            if ecg and (not blk_ok or blk_i <= ECG_COPY_ROWS): continue  # keep rows 65..192
                             parsed_time = parse_vsc_timestamp(parts[2])
                             if not parsed_time: continue
                             try: value_float = float(parts[3])
@@ -304,6 +341,11 @@ async def tail_file(config: dict[str, Any], client: aiomqtt.Client):
                             waveforms_buffer.append((parsed_time, physio_id, value_float))
                             payload = json.dumps({"time": parsed_time.timestamp(), "physio_id": physio_id, "value": value_float})
                             await client.publish(topic, payload=payload, qos=0)
+                            if eeg and blk_ok and blk_i <= EEG_CHANNELS * EEG_CHANNEL_ROWS:  # rows 1..32 -> EEG1, 33..64 -> EEG2
+                                ch_id, ch_topic = eeg_topics[(blk_i - 1) // EEG_CHANNEL_ROWS + 1]
+                                waveforms_buffer.append((parsed_time, ch_id, value_float))
+                                payload = json.dumps({"time": parsed_time.timestamp(), "physio_id": ch_id, "value": value_float})
+                                await client.publish(ch_topic, payload=payload, qos=0)
                         except Exception as e:
                             print(f"Skipped bad CSV line on {topic}: {e} | {line[:120]!r}")
 
@@ -1325,7 +1367,10 @@ async def session_quality(session_id: int):
 # each ECG burst is classed by its size (768 rows with copies, 512 without)
 # and only in a burst with copies are rows 0..63 of each 192-row block,
 # counted from the burst start, dropped. Either way the ECG channel holds real
-# samples only (512 per frame, about 499.8 Hz). Values are scaled symmetrically
+# samples only (512 per frame, about 499.8 Hz). The EEG wave interleaves two
+# channels (see EEG_WAVE_ID): where a session has the per-channel split (since
+# WOR-1008) the EDF carries EEG1 and EEG2 instead of the combined wave, older
+# sessions keep the combined one. Values are scaled symmetrically
 # (digital 0 == physical 0) so the zero filler is honest. Channels stream from
 # DB cursors into temp files, then interleave into EDF records, so memory
 # stays flat for GB sessions. The export stats (period, rates, copy rows
@@ -1494,7 +1539,14 @@ def _edf_layout(stamps: list[list[float | None]]) -> tuple[float, float, list[li
     return t0, period, place(float(_edf_duration(period)))
 
 def _edf_label(physio_id: str) -> str:
+    if physio_id.startswith(EEG_WAVE_ID + "_"): return physio_id[len(EEG_WAVE_ID) + 1:]  # EEG1 / EEG2
     return physio_id[4:] if physio_id.startswith("NOM_") else physio_id
+
+def _edf_physio_ids(ids: list[str]) -> list[str]:
+    """The waveform ids an EDF carries: the combined EEG wave only where the
+    session has no per-channel split (recorded before WOR-1008)."""
+    split = eeg_channel_id(EEG_WAVE_ID, 1) in ids
+    return [i for i in ids if not (split and i == EEG_WAVE_ID)]
 
 def _edf_write(o: BinaryIO, chans: list[_EdfChannel], patient: str, recording: str) -> dict[str, Any]:
     """Lay the channels' frames onto records and write the EDF to o. Every channel
@@ -1577,6 +1629,8 @@ async def _export_session_edf(session_id: int) -> dict[str, Any]:
             r["started_at"], end)
         if not lims:
             return {"ok": False, "error": "session has no waveform data"}
+        keep = set(_edf_physio_ids([q["physio_id"] for q in lims]))
+        lims = [q for q in lims if q["physio_id"] in keep]
 
         out = _session_package_dir(r)
         out.mkdir(parents=True, exist_ok=True)

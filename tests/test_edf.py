@@ -23,8 +23,10 @@ import vscc_mqtt_timescale_worker as w
 ECG = "NOM_ECG_ELEC_POTL_II"
 PLETH = "NOM_PLETH"
 RESP = "NOM_RESP"
-FRAME_ROWS = {ECG: 768, PLETH: 128, RESP: 64}
-SPR = {ECG: 512, PLETH: 128, RESP: 64}
+EEG1 = w.eeg_channel_id(w.EEG_WAVE_ID, 1)
+EEG2 = w.eeg_channel_id(w.EEG_WAVE_ID, 2)
+FRAME_ROWS = {ECG: 768, PLETH: 128, RESP: 64, EEG1: 128, EEG2: 128}
+SPR = {ECG: 512, PLETH: 128, RESP: 64, EEG1: 128, EEG2: 128}
 P = 1.0244
 T0 = 1_761_600_000.0
 
@@ -146,6 +148,16 @@ def test_ecg_copies_told_apart_per_burst() -> None:
     assert _kept([100] * 700) == ([100] * 700, 0)
 
 
+def test_edf_carries_the_split_eeg_channels_not_the_combined_wave() -> None:
+    # WOR-1008: a session with the per-channel EEG split exports EEG1 and EEG2;
+    # one recorded before it keeps the combined wave.
+    assert w._edf_physio_ids([w.EEG_WAVE_ID, EEG1, EEG2, PLETH]) == [EEG1, EEG2, PLETH]
+    assert w._edf_physio_ids([w.EEG_WAVE_ID, PLETH]) == [w.EEG_WAVE_ID, PLETH]
+    # the 16-char label field would cut both ids to the same text
+    assert (w._edf_label(EEG1), w._edf_label(EEG2)) == ("EEG1", "EEG2")
+    assert w._edf_label(w.EEG_WAVE_ID) == "EEG_ELEC_POTL_CRTX"
+
+
 def test_edf_duration_fills_the_8_char_field() -> None:
     assert w._edf_duration(1.0244) == "1.024400"
     assert w._edf_duration(1.02443049) == "1.024430"
@@ -241,6 +253,17 @@ def test_gap_free_capture_has_no_padding(tmp_path: Path) -> None:
     _check_counts(stats, sig)
 
 
+def test_eeg_channels_export_at_128_samples_per_record(tmp_path: Path) -> None:
+    feed, want = _session(8, lambda k: T0 + k * P, channels=(EEG1, EEG2, PLETH))
+    path, stats = _export(tmp_path, feed)
+    head, sig = _parse(path)
+
+    assert head["labels"] == ["EEG1", "EEG2", _label(PLETH)]
+    assert head["spr"] == [128, 128, 128]
+    assert sig == {"EEG1": want[EEG1], "EEG2": want[EEG2], _label(PLETH): want[PLETH]}
+    _check_counts(stats, sig)
+
+
 def test_period_far_from_nominal_adds_no_gaps(tmp_path: Path) -> None:
     # 1.030 s frames over 2000 frames drift 12 s off the nominal 1.024 grid.
     feed, want = _session(2000, lambda k: T0 + k * 1.03 + ((k * 7) % 11 - 5) / 1000, channels=(PLETH,))
@@ -292,7 +315,8 @@ def test_pyedflib_reads_the_true_rates(tmp_path: Path) -> None:
     try:
         assert f.datarecords_in_file == 6
         assert f.getSignalLabels() == ["ECG_ELEC_POTL_II", "PLETH", "RESP"]
-        for i, (pid, spr) in enumerate(SPR.items()):
+        for i, pid in enumerate((ECG, PLETH, RESP)):
+            spr = SPR[pid]
             assert f.getSampleFrequency(i) == pytest.approx(spr / 1.0244)
             assert f.readSignal(i, digital=True).tolist() == want[pid]
         assert f.getFileDuration() == pytest.approx(6 * 1.0244)

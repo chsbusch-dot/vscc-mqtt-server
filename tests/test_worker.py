@@ -51,6 +51,13 @@ def test_wave_topic_unknown_nom_id_slugifies():
     assert w.wave_topic("NOM_EEG_ELEC_POTL_CRTX") == "mp50/HF-EEG_ELEC_POTL_CRTX"
 
 
+def test_eeg_channel_ids_and_topics():
+    # WOR-1008: per-channel EEG series sit alongside the combined one.
+    assert w.eeg_channel_id("NOM_EEG_PWR_SPEC_TOT", 2) == "NOM_EEG_PWR_SPEC_TOT_EEG2"
+    assert w.wave_topic(w.eeg_channel_id(w.EEG_WAVE_ID, 1)) == "mp50/HF-EEG_ELEC_POTL_CRTX_EEG1"
+    assert w.wave_topic(w.eeg_channel_id(w.EEG_WAVE_ID, 2)) == "mp50/HF-EEG_ELEC_POTL_CRTX_EEG2"
+
+
 def test_wave_topic_non_nom_id_slugifies():
     assert w.wave_topic("CUSTOM_SIGNAL") == "mp50/HF-CUSTOM_SIGNAL"
 
