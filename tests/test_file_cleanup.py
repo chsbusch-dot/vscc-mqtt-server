@@ -130,6 +130,24 @@ def test_cleanup_truncates_idle_files_and_restarts_once(fc: ModuleType, tmp_path
     assert restart.calls == 1
 
 
+def test_cleanup_gives_the_eeg_wave_its_own_cap(fc: ModuleType, tmp_path: Path) -> None:
+    eeg_name = "NOM_EEG_ELEC_POTL_CRTXWaveExport.csv"
+    eeg = tmp_path / eeg_name
+    pleth = tmp_path / "NOM_PLETHWaveExport.csv"
+    _write(eeg, b"0123456789abcdef")
+    _write(pleth, b"ABCDEFGHIJKLMNOP")
+    restart = _Restart()
+
+    truncated = fc.cleanup_files(tmp_path, max_bytes=6, restart=restart, caps={eeg_name: 10})
+
+    assert sorted(truncated) == [eeg_name, "NOM_PLETHWaveExport.csv"]
+    assert eeg.read_bytes() == b"6789abcdef"  # its own cap, not max_bytes
+    assert pleth.read_bytes() == b"KLMNOP"
+    assert restart.calls == 1
+    # a whole night of raw EEG (~440-600 MiB) fits under the shipped cap
+    assert fc.FILE_CAPS[eeg_name] >= 600 * 1024 * 1024
+
+
 def test_cleanup_skips_while_capture_is_live(fc: ModuleType, tmp_path: Path) -> None:
     wave = tmp_path / "NOM_ECG_ELEC_POTL_IIWaveExport.csv"
     _write(wave, b"0123456789abcdef", mtime=time.time())

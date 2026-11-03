@@ -164,6 +164,105 @@ async def test_tail_file_csv_drops_ecg_copy_rows(tmp_path: Path, physio_id: str,
     assert [row[2] for row in w.waveforms_buffer if row[1] == physio_id] == want
 
 
+async def _feed_tail(tmp_path: Path, config: dict[str, Any], lines: list[str], n_want: int) -> FakeMqttClient:
+    """Start tail_file on an empty file, append lines past its seek-to-end, and
+    return the client once n_want publishes landed (plus a beat for extras)."""
+    f = config["path"]
+    f.write_text("")
+    client = FakeMqttClient()
+    task = asyncio.create_task(w.tail_file(config, cast(Any, client)))
+    try:
+        await asyncio.sleep(0.5)  # let tail_file open the file and seek to EOF
+        with open(f, "a") as fh:
+            fh.write("".join(line + "\n" for line in lines))
+        for _ in range(int(TIMEOUT / 0.05)):
+            if len(client.published) >= n_want:
+                break
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.2)  # rows past n_want would land here
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    return client
+
+
+async def test_tail_file_csv_splits_eeg_channels(tmp_path: Path) -> None:
+    # WOR-1008: each 64-row col1 block of the EEG wave is 32 rows of channel 1,
+    # then 32 of channel 2. The combined series stays as it was; the per-channel
+    # ones start at the first full block (the lead-in can't be placed).
+    w.waveforms_buffer.clear()
+    pid = w.EEG_WAVE_ID
+    stamp = "14-03-2026 04:39:00.500"
+    lead_in = [f"0,1000,{stamp},{9000 + i}" for i in range(20)]
+    blocks = [f"{b},{3048 + 2048 * b},{stamp},{1000 * b + i}" for b in range(3) for i in range(64)]
+    combined = [9000 + i for i in range(20)] + [1000 * b + i for b in range(3) for i in range(64)]
+    eeg1 = [1000 * b + i for b in range(3) for i in range(32)]
+    eeg2 = [1000 * b + i for b in range(3) for i in range(32, 64)]
+    config = {"path": tmp_path / f"{pid}WaveExport.csv", "type": "csv",
+              "topic": w.wave_topic(pid), "physio_id": pid}
+
+    client = await _feed_tail(tmp_path, config, lead_in + blocks, len(combined) + len(eeg1) + len(eeg2))
+
+    def on(topic: str) -> list[tuple[str, float]]:
+        return [(p["physio_id"], p["value"]) for t, p in client.published if t == topic]
+    assert on("mp50/HF-EEG_ELEC_POTL_CRTX") == [(pid, v) for v in combined]
+    assert on("mp50/HF-EEG_ELEC_POTL_CRTX_EEG1") == [(f"{pid}_EEG1", v) for v in eeg1]
+    assert on("mp50/HF-EEG_ELEC_POTL_CRTX_EEG2") == [(f"{pid}_EEG2", v) for v in eeg2]
+    assert len(client.published) == len(combined) + len(eeg1) + len(eeg2)
+    for want_id, want in ((pid, combined), (f"{pid}_EEG1", eeg1), (f"{pid}_EEG2", eeg2)):
+        assert [row[2] for row in w.waveforms_buffer if row[1] == want_id] == want
+
+
+async def test_tail_file_json_splits_eeg_numerics(tmp_path: Path) -> None:
+    # WOR-1008: an EEG numerics poll is two lines with the same
+    # Relativetimestamp, channel 1 first. The combined ids stay as they were;
+    # the poll the tailer joins mid-way (here its second line) gets no channel,
+    # and a non-EEG line in between does not break a pair.
+    w.numerics_buffer.clear()
+    tot, alpha = "NOM_EEG_PWR_SPEC_TOT", "NOM_EEG_PWR_SPEC_ALPHA_REL"
+
+    def eeg(rel: int, v_tot: str, v_alpha: str) -> str:
+        return json.dumps([
+            {"Timestamp": "14-03-2026 04:39:00", "Relativetimestamp": rel, "PhysioID": tot, "Value": v_tot},
+            {"Timestamp": "14-03-2026 04:39:00", "Relativetimestamp": rel, "PhysioID": alpha, "Value": v_alpha},
+        ])
+    hr = json.dumps([{"Timestamp": "14-03-2026 04:39:00", "Relativetimestamp": 8292, "PhysioID": "NOM_HR", "Value": "60"}])
+    lines = [eeg(100, "1", "2"),                       # lead-in: second line of a poll
+             eeg(8292, "11", "12"), hr, eeg(8292, "21", "-"),
+             eeg(16484, "31", "32"), eeg(16484, "41", "42")]
+    want = {tot: [1.0, 11.0, 21.0, 31.0, 41.0], alpha: [2.0, 12.0, 32.0, 42.0], "NOM_HR": [60.0],
+            f"{tot}_EEG1": [11.0, 31.0], f"{tot}_EEG2": [21.0, 41.0],
+            f"{alpha}_EEG1": [12.0, 32.0], f"{alpha}_EEG2": [42.0]}
+    config = {"path": tmp_path / "DataExportVSC.json", "type": "json", "topic": "mp50/VitalSigns", "physio_id": None}
+
+    client = await _feed_tail(tmp_path, config, lines, sum(len(v) for v in want.values()))
+
+    assert {t for t, _ in client.published} == {"mp50/VitalSigns"}
+    got: dict[str, list[float]] = {}
+    for _, p in client.published:
+        got.setdefault(p["physio_id"], []).append(p["value"])
+    assert got == want
+    buffered: dict[str, list[float]] = {}
+    for row in w.numerics_buffer:
+        buffered.setdefault(row[1], []).append(row[2])
+    assert buffered == want
+
+
+async def test_tail_file_eeg_disconnect_nulls_every_channel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(w, "WAVEFORM_DISCONNECT_TIMEOUT", 0.1)
+    pid = w.EEG_WAVE_ID
+    config = {"path": tmp_path / f"{pid}WaveExport.csv", "type": "csv",
+              "topic": w.wave_topic(pid), "physio_id": pid}
+
+    client = await _feed_tail(tmp_path, config, [], 3)
+
+    assert sorted((t, p["physio_id"], p["value"]) for t, p in client.published) == [
+        ("mp50/HF-EEG_ELEC_POTL_CRTX", pid, None),
+        ("mp50/HF-EEG_ELEC_POTL_CRTX_EEG1", f"{pid}_EEG1", None),
+        ("mp50/HF-EEG_ELEC_POTL_CRTX_EEG2", f"{pid}_EEG2", None),
+    ]
+
+
 async def test_batch_inserter_flushes_numerics():
     w.db_pool = FakePool()
     w.numerics_buffer = [(datetime(2026, 3, 14, 4, 39, tzinfo=UTC), "NOM_HR", 88.0)]

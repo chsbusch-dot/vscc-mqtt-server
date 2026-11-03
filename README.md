@@ -171,6 +171,17 @@ The worker publishes numerics to `mp50/VitalSigns` and waveforms to per-signal t
 
 `time` is Unix epoch **seconds UTC**. A `value: null` message on a waveform topic signals a lead-off/disconnect. Subscribe to everything with topic filter `mp50/#` (the React dashboard's default).
 
+**EEG channels (WOR-1008).** The MP50 exports its two EEG channels as one wave (`NOM_EEG_ELEC_POTL_CRTX`) and one set of `NOM_EEG_*` numerics. Each 64-row wave message is 32 rows of channel 1, then 32 of channel 2 (~125 Hz each), and each EEG numerics poll is two `DataExportVSC.json` lines with the same `Relativetimestamp`, channel 1 first. The worker keeps the combined series exactly as before and adds per-channel series alongside, named `<PhysioID>_EEG1` / `<PhysioID>_EEG2`:
+
+| Series | MQTT topic | `physio_id` (MQTT and DB) |
+| --- | --- | --- |
+| combined wave (unchanged) | `mp50/HF-EEG_ELEC_POTL_CRTX` | `NOM_EEG_ELEC_POTL_CRTX` |
+| channel 1 / 2 wave | `mp50/HF-EEG_ELEC_POTL_CRTX_EEG1` / `_EEG2` | `NOM_EEG_ELEC_POTL_CRTX_EEG1` / `_EEG2` |
+| combined numerics (unchanged) | `mp50/VitalSigns` | `NOM_EEG_PWR_SPEC_TOT`, `NOM_EEG_FREQ_PWR_SPEC_CRTX_SPECTRAL_EDGE`, ... |
+| channel 1 / 2 numerics | `mp50/VitalSigns` | `NOM_EEG_PWR_SPEC_TOT_EEG1` / `_EEG2`, ... (every `NOM_EEG_*` numeric) |
+
+The first wave block and the first numerics poll after the worker opens a file get no per-channel rows (the worker may have joined them mid-way). The EDF export carries `EEG1` and `EEG2` instead of the combined wave for sessions that have the split; older sessions keep the combined channel. Which electrode pair is channel 1 is not confirmed yet.
+
 ### Timestamps and `MONITOR_TZ`
 
 VSCapture writes wall-clock **local** time into its exports. The worker and streamer parse it in the timezone given by the `MONITOR_TZ` environment variable (default `America/Los_Angeles`, set in `vscc-docker-compose.yml`) and convert to UTC before publishing or storing. If the capture host moves to another timezone, change `MONITOR_TZ` — otherwise all data lands hours offset from `NOW()` and `/api/historic` queries return nothing.
@@ -349,7 +360,7 @@ Logs: `journalctl -u vscc-capture-cli -f`, `journalctl -u vscc-websocket-streame
 
 The installer automatically sets up cron jobs to keep the system running smoothly.
 
--   **Hourly File Cleanup:** The `VSCaptureCLI` tool generates several large data files. To prevent these from consuming excessive disk space, the `vscc-file-cleanup.py` script runs every hour, truncates any data file that grows beyond 20MB, and then restarts the VSCapture process (via the keep-alive wrapper) so it re-binds to the fresh file inodes.
+-   **Hourly File Cleanup:** The `VSCaptureCLI` tool generates several large data files. To prevent these from consuming excessive disk space, the `vscc-file-cleanup.py` script runs every hour, truncates any data file that grows beyond 20MB (the raw EEG wave `NOM_EEG_ELEC_POTL_CRTXWaveExport.csv` gets 640 MiB, about one night, since it grows ~55 MiB per recorded hour), and then restarts the VSCapture process (via the keep-alive wrapper) so it re-binds to the fresh file inodes.
 -   **Quarterly Updates:** The `update.sh` script runs every three months and pulls the images referenced in `vscc-docker-compose.yml`. Image tags are **pinned** (`emqx/emqx:6.3.2`, `timescale/timescaledb:2.19.3-pg14`), so upgrades only happen when a tag is deliberately bumped in the compose file — floating `latest` tags previously risked unattended breaking upgrades.
 
 ## Testing VSCapture's Direct MQTT Export

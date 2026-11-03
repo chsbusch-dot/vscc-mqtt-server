@@ -13,6 +13,13 @@ CAPTURE_DIR = Path(os.getenv("VSC_CAPTURE_DIR") or BASE_DIR / "VSCapture")
 # Max file size in bytes (20 MB)
 MAX_SIZE_BYTES = 20 * 1024 * 1024
 
+# Per-file caps above MAX_SIZE_BYTES. The EEG wave grows ~55 MiB per recorded
+# hour, so 20 MB would keep only the last ~20 min of a night; 640 MiB keeps a
+# whole night (~440-600 MiB) of raw EEG for reprocessing (WOR-1008).
+FILE_CAPS = {
+    "NOM_EEG_ELEC_POTL_CRTXWaveExport.csv": 640 * 1024 * 1024,
+}
+
 # The capture counts as live while any export file was written within this many
 # seconds (DataExportVSC.json is written every numerics interval while the
 # monitor is associated). A truncation restarts VSCapture, which would cost a
@@ -62,10 +69,12 @@ def cleanup_files(
     max_bytes: int = MAX_SIZE_BYTES,
     now: float | None = None,
     restart: Callable[[], None] = restart_capture,
+    caps: dict[str, int] = FILE_CAPS,
 ) -> list[str]:
     """
     Checks the export files in the capture directory and truncates them
-    if they exceed max_bytes, keeping the most recent data.
+    if they exceed max_bytes (or their own cap in caps), keeping the most
+    recent data.
     Returns the names of the truncated files.
     """
     print(f"[{Path(__file__).name}] Starting file cleanup check in: {capture_dir}")
@@ -85,16 +94,17 @@ def cleanup_files(
         filename = file_path.name
         try:
             current_size = file_path.stat().st_size
+            limit = caps.get(filename, max_bytes)
 
-            if current_size > max_bytes:
-                print(f"File '{filename}' is {current_size / 1024 / 1024:.2f} MB, which exceeds the {max_bytes / 1024 / 1024:.0f} MB limit. Truncating...")
+            if current_size > limit:
+                print(f"File '{filename}' is {current_size / 1024 / 1024:.2f} MB, which exceeds the {limit / 1024 / 1024:.0f} MB limit. Truncating...")
 
                 # Define a temporary file path
                 temp_path = file_path.with_suffix(f"{file_path.suffix}.tmp")
 
                 # Use shell's `tail` and `mv` for efficient, atomic truncation
                 # This is safer than reading/writing in Python for large files
-                cmd = f"tail -c {max_bytes} '{file_path}' > '{temp_path}' && mv '{temp_path}' '{file_path}'"
+                cmd = f"tail -c {limit} '{file_path}' > '{temp_path}' && mv '{temp_path}' '{file_path}'"
 
                 # Execute the command in a shell
                 process = subprocess.run(cmd, shell=True, capture_output=True, text=True)
