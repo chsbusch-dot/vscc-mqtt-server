@@ -42,6 +42,18 @@ Research and education use only — not a medical device.
 - **High-frequency waveforms** — **Pleth** and **Respiration** rendered as continuous traces, plus **ECG** channels (any new monitor module's waveform export is auto-discovered and published — no code change)
 - **Numeric vitals** — SpO₂, pulse rate, NIBP, respiration rate, heart rate, and every other numeric the monitor exports
 
+### New: EEG in VSCC Premium
+
+VSCC Premium is a separate, closed-source edition built on this open core. The open core stays MIT licensed and complete on its own. Premium adds a live EEG density spectral array: a rolling 30 minute multitaper spectrogram with SEF95 and band power shares. It also includes EEG night charts with a hypnogram from an automated sleep-stage estimate, plus overnight reports for heart, SpO₂ desaturations per hour and restless nights. These tools are for research and education use only. They are not a sleep study or a diagnosis, and VSCC Premium is not a medical device.
+
+[![EEG density spectral array](https://raw.githubusercontent.com/chsbusch-dot/vscc-dashboard-client/main/docs/screenshots/premium-eeg-dsa.png)](https://github.com/chsbusch-dot/vscc-dashboard-client#vscc-premium-eeg-panels)
+
+[![EEG night charts](https://raw.githubusercontent.com/chsbusch-dot/vscc-dashboard-client/main/docs/screenshots/premium-eeg-night.png)](https://github.com/chsbusch-dot/vscc-dashboard-client#vscc-premium-eeg-panels)
+
+> Screenshots show synthetic data, not a recording.
+
+[Open an issue](https://github.com/chsbusch-dot/vscc-mqtt-server/issues/new?title=VSCC%20Premium%20interest) if you are interested. I will get back to you.
+
 ## Quick Start
 
 All you need is Docker — on Linux, macOS (Docker Desktop), Windows (Docker
